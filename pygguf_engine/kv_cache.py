@@ -10,7 +10,7 @@ Big-Context Quantized KV Cache (`int4`, `int8`, & `fp16`) with:
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -19,8 +19,7 @@ from .quant_kernels import cuda_device_scope
 
 try:
     import triton
-    import triton.language as triton_lang
-    tl = triton_lang
+    import triton.language as tl
     HAS_TRITON = True
 except ImportError:
     triton = None  # type: ignore[assignment]
@@ -1896,14 +1895,33 @@ class LayerKVCache:
                 k_full, v_full = self._get_ring_dequant_window(win_start, end_pos, q.dtype)
             else:
                 k_full, v_full = self.get_dequant_slice(0, total_len, q.dtype)
-            if gqa_group > 1:
-                k_full = k_full.repeat_interleave(gqa_group, dim=1)
-                v_full = v_full.repeat_interleave(gqa_group, dim=1)
+
+            # Prefer native GQA (`enable_gqa`, torch >= 2.5) so K/V are never expanded in memory;
+            # fall back to `repeat_interleave` on unsupported backends/builds.
+            sdpa_gqa = gqa_group > 1
+
+            def _sdpa(
+                _q: torch.Tensor,
+                _k: torch.Tensor,
+                _v: torch.Tensor,
+                **_kw: Any,
+            ) -> torch.Tensor:
+                if sdpa_gqa:
+                    try:
+                        return F.scaled_dot_product_attention(_q, _k, _v, enable_gqa=True, **_kw)
+                    except Exception:
+                        return F.scaled_dot_product_attention(
+                            _q,
+                            _k.repeat_interleave(gqa_group, dim=1),
+                            _v.repeat_interleave(gqa_group, dim=1),
+                            **_kw,
+                        )
+                return F.scaled_dot_product_attention(_q, _k, _v, **_kw)
 
             if q_len == 1:
-                return F.scaled_dot_product_attention(q, k_full, v_full, is_causal=False, scale=sm_scale)
+                return _sdpa(q, k_full, v_full, is_causal=False, scale=sm_scale)
             if start_pos == 0 and win_start == 0:
-                return F.scaled_dot_product_attention(q, k_full, v_full, is_causal=True, scale=sm_scale)
+                return _sdpa(q, k_full, v_full, is_causal=True, scale=sm_scale)
 
             # Speculative / multi-token append (`start_pos > 0` or ring window): explicit causal + window mask
             q_pos = torch.arange(start_pos, start_pos + q_len, device=q.device).unsqueeze(1)
@@ -1912,37 +1930,48 @@ class LayerKVCache:
                 attn_mask = (k_pos <= q_pos) & (k_pos > (q_pos - self.sliding_window))
             else:
                 attn_mask = k_pos <= q_pos  # [q_len, total_len] bool mask (True = keep)
-            return F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask, scale=sm_scale)
+            return _sdpa(q, k_full, v_full, attn_mask=attn_mask, scale=sm_scale)
 
-        # Path 3: Online-Softmax Chunked Attention for Big Contexts (32K-256K+) or Gemma Softcapping
+        # Path 3: Online-Softmax Chunked Attention for Big Contexts (32K-256K+) or Gemma Softcapping.
+        # GQA group is folded into the query-row dimension (`2*qc` rows per kv-head) so K/V chunks are
+        # never expanded; tensor-core fp16/bf16 matmuls with FP32 online-softmax bookkeeping.
+        n_kv = self.n_kv_heads
         q_chunk_len = 512
         outputs: List[torch.Tensor] = []
+        # Prefill matmuls prefer fp16 compute on CUDA tensor cores; CPU stays fp32 for accuracy.
+        compute_dtype = torch.float16 if q.is_cuda and head_dim % 8 == 0 else torch.float32
 
         for q_off in range(0, q_len, q_chunk_len):
             q_end = min(q_len, q_off + q_chunk_len)
             qc_len = q_end - q_off
-            q_sub = q[:, :, q_off:q_end, :].float()  # [1, H, qc_len, D]
-            q_abs_pos = torch.arange(start_pos + q_off, start_pos + q_end, device=q.device).view(1, 1, qc_len, 1)
-            max_visible_k = start_pos + q_end
+            q_sub = q[:, :, q_off:q_end, :]  # [1, H, qc_len, D]
+            n_elems_g = gqa_group * qc_len
+            # [1, H=nkv*g, qc, D] -> [1, nkv, g*qc, D] (row r = j*qc + s covers group head j, position s)
+            q_fold = (
+                q_sub.to(compute_dtype)
+                .view(1, n_kv, gqa_group, qc_len, head_dim)
+                .reshape(1, n_kv, n_elems_g, head_dim)
+            )
+            # Per folded row r: query position = start_pos + q_off + (r % qc_len)
+            row_abs_pos = (torch.arange(n_elems_g, device=q.device) % qc_len) + (start_pos + q_off)
+            max_visible_k = min(total_len, start_pos + q_end)
 
-            m_i = torch.full((1, n_heads, qc_len, 1), float("-inf"), device=q.device, dtype=torch.float32)
-            l_i = torch.zeros((1, n_heads, qc_len, 1), device=q.device, dtype=torch.float32)
-            acc_o = torch.zeros((1, n_heads, qc_len, head_dim), device=q.device, dtype=torch.float32)
+            m_i = torch.full((1, n_kv, n_elems_g, 1), float("-inf"), device=q.device, dtype=torch.float32)
+            l_i = torch.zeros((1, n_kv, n_elems_g, 1), device=q.device, dtype=torch.float32)
+            acc_o = torch.zeros((1, n_kv, n_elems_g, head_dim), device=q.device, dtype=torch.float32)
 
-            for kv_off in range(0, min(total_len, max_visible_k), kv_chunk_size):
+            for kv_off in range(0, max_visible_k, kv_chunk_size):
                 kv_end = min(total_len, kv_off + kv_chunk_size)
-                k_chunk, v_chunk = self.get_dequant_slice(kv_off, kv_end, torch.float32)
-                if gqa_group > 1:
-                    k_chunk = k_chunk.repeat_interleave(gqa_group, dim=1)
-                    v_chunk = v_chunk.repeat_interleave(gqa_group, dim=1)
+                k_chunk, v_chunk = self.get_dequant_slice(kv_off, kv_end, compute_dtype)
 
-                scores = torch.matmul(q_sub, k_chunk.transpose(-2, -1)) * sm_scale
+                scores = torch.matmul(q_fold, k_chunk.transpose(-2, -1)).float() * sm_scale
                 if softcap > 0.0:
                     scores = torch.tanh(scores / softcap) * softcap
 
                 if kv_end > start_pos + q_off:
+                    # Only the chunks overlapping the causal boundary need a mask
                     k_abs_pos = torch.arange(kv_off, kv_end, device=q.device).view(1, 1, 1, -1)
-                    scores = scores.masked_fill(k_abs_pos > q_abs_pos, float("-inf"))
+                    scores = scores.masked_fill(k_abs_pos > row_abs_pos.view(1, 1, n_elems_g, 1), float("-inf"))
 
                 m_ij = scores.amax(dim=-1, keepdim=True)
                 m_new = torch.maximum(m_i, m_ij)
@@ -1953,11 +1982,13 @@ class LayerKVCache:
                 alpha = torch.where(torch.isinf(m_i), torch.zeros_like(m_i), torch.exp(m_i_safe - m_new_safe))
                 p = torch.exp(scores - m_new_safe)
 
-                acc_o = acc_o * alpha + torch.matmul(p, v_chunk)
+                acc_o = acc_o * alpha + torch.matmul(p.to(compute_dtype), v_chunk).float()
                 l_i = l_i * alpha + p.sum(dim=-1, keepdim=True)
                 m_i = m_new
 
-            outputs.append((acc_o / l_i.clamp(min=1e-20)).to(q.dtype))
+            out = (acc_o / l_i.clamp(min=1e-20)).to(q.dtype)
+            # Unfold: [1, nkv, g*qc, D] -> [1, nkv, g, qc, D] -> [1, H, qc, D] (head h = kv_head * g + j)
+            outputs.append(out.view(1, n_kv, gqa_group, qc_len, head_dim).reshape(1, n_heads, qc_len, head_dim))
 
         return torch.cat(outputs, dim=2)
 
@@ -2280,6 +2311,24 @@ class EngineKVCacheManager:
                 total += lkv.k_buf.numel() * lkv.k_buf.element_size() * 2
             if lkv.k_scale is not None:
                 total += lkv.k_scale.numel() * lkv.k_scale.element_size() * 2
+        for _key, st in self._iter_all_recurrent_states():
+            total += st.allocated_bytes()
+        return total
+
+    def projected_max_vram_bytes(self) -> int:
+        """Exact bytes the KV buffers would occupy at their configured full capacity
+        (non-ring layers: `max_seq_len`; sliding-window layers: their ring cap).
+        Does NOT allocate anything; recurrent-state bytes are counted as already allocated."""
+        total = 0
+        for lkv in self._iter_all_kv_caches() + self._iter_mtp_kv_caches():
+            cap = lkv._ring_cap if lkv._ring_cap is not None else lkv.max_seq_len
+            if lkv.kv_dtype == "int4":
+                per_pos_per_head = lkv.head_dim + 8  # K+V int4 packed nibbles + fp16 K/V scales
+            elif lkv.kv_dtype == "int8":
+                per_pos_per_head = 2 * lkv.head_dim + 4  # K+V int8 + fp16 K/V scales
+            else:
+                per_pos_per_head = 4 * lkv.head_dim  # K+V fp16
+            total += cap * lkv.n_kv_heads * per_pos_per_head
         for _key, st in self._iter_all_recurrent_states():
             total += st.allocated_bytes()
         return total

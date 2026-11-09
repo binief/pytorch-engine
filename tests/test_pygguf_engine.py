@@ -10,8 +10,10 @@ End-to-end verification suite for `pygguf_engine`:
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import gguf
 import gguf.quants as gq
@@ -100,7 +102,12 @@ def test_quant_repack_and_matmul_exactness() -> None:
         print(f"  [OK] {qtype.name:6s} -> W8A16 max_err = {max_err:.6f}")
 
 
-def _build_synthetic_gguf(path: Path, is_moe: bool = False) -> None:
+def _build_synthetic_gguf(
+    path: Path,
+    is_moe: bool = False,
+    rope_scaling: Optional[dict] = None,
+    context_length: int = 4096,
+) -> None:
     arch = "qwen3moe" if is_moe else "qwen3"
     writer = gguf.GGUFWriter(str(path), arch)
 
@@ -120,10 +127,23 @@ def _build_synthetic_gguf(path: Path, is_moe: bool = False) -> None:
     writer.add_head_count_kv(n_kv_heads)
     writer.add_key_length(head_dim)
     writer.add_value_length(head_dim)
-    writer.add_context_length(4096)
+    writer.add_context_length(context_length)
     writer.add_layer_norm_rms_eps(1e-6)
     writer.add_rope_dimension_count(head_dim)
     writer.add_rope_freq_base(10000.0)
+    if rope_scaling:
+        import gguf as _gguf
+        scaling_type = _gguf.RopeScalingType(str(rope_scaling.get("type", "yarn")))
+        writer.add_rope_scaling_type(scaling_type)
+        factor = float(rope_scaling.get("factor", 2.0))
+        writer.add_rope_scaling_factor(factor)
+        writer.add_rope_scaling_orig_ctx_len(int(rope_scaling.get("orig_ctx_len", 4096)))
+        if scaling_type == _gguf.RopeScalingType.YARN:
+            writer.add_rope_scaling_yarn_beta_fast(float(rope_scaling.get("beta_fast", 32.0)))
+            writer.add_rope_scaling_yarn_beta_slow(float(rope_scaling.get("beta_slow", 1.0)))
+            writer.add_rope_scaling_yarn_ext_factor(float(rope_scaling.get("ext_factor", 1.0)))
+            if "attn_factor" in rope_scaling:
+                writer.add_rope_scaling_yarn_attn_factor(float(rope_scaling["attn_factor"]))
 
     if is_moe:
         n_experts = 4
@@ -1035,13 +1055,28 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
                                WINDOW_SIZE=9 if ring else 0)
                     specs.append((f"{name}_Q{q_len}_R{int(ring)}", fn, tgt, sig, cfg, check))
     for name, fn, tgt, sig, constexprs, assert_zero_b8 in specs:
-        compiled = triton_compile(ASTSource(fn=fn, signature=sig, constexprs=constexprs), target=tgt)
+        # Triton 3.x prototype argument order follows `signature` insertion order; normalize the
+        # spec dict to the kernel's actual parameter order and sanity-check coverage.
+        import inspect as _inspect
+        required = {p.name for p in fn.params if not p.is_constexpr and p.default is _inspect._empty}
+        allowed = {p.name for p in fn.params if not p.is_constexpr}
+        assert required <= set(sig) <= allowed, f"{name}: signature/parameter mismatch: {set(sig) ^ required}"
+        sig = {a: sig[a] for a in fn.arg_names if a in sig}
+        compiled = triton_compile(ASTSource(fn=fn, signature=sig, constants=constexprs), target=tgt)
         ptx = compiled.asm["ptx"]
         assert len(ptx) > 1000
         if assert_zero_b8:
             b8_loads = [ln for ln in ptx.splitlines() if "ld.global" in ln and (".b8" in ln or ".u8" in ln or ".s8" in ln)]
             assert len(b8_loads) == 0, f"{name} emitted scalar byte loads: {b8_loads[:3]}"
-            b32_loads = [ln for ln in ptx.splitlines() if "ld.global" in ln and "32" in ln]
+            # Ampere+ Triton lowers 32/64/128-bit global->shared staging to `cp.async...shared.global`
+            # (no `ld.global` token), so count both cp.async payloads >= 4 bytes and plain ld.global.32 accesses.
+            import re as _re
+            b32_loads = [
+                ln
+                for ln in ptx.splitlines()
+                if ("ld.global" in ln and "32" in ln)
+                or _re.search(r"cp\.async[^;]*shared\.global[^;]*(0x4\b|0x8\b|0x10\b|\.b32\b)", ln)
+            ]
             assert len(b32_loads) > 0, f"{name} missing 32-bit loads"
         print(f"  [OK] Triton PTX compiled: {name:20s} ({len(ptx):,} bytes)")
 
@@ -1123,7 +1158,7 @@ _dequant_w8_chunk_kernel[(triton.cdiv(N, 16), K // 16)](
 )
 ref8_m = exec_w8a16_matmul(x_big, qw8, s8, z8, b4)
 lin8_m = torch.nn.functional.linear(x_big, dq8, b4)
-assert (out8_m - lin8_m).abs().max().item() <= 1e-2
+assert (out8_m - lin8_m).abs().max().item() <= 0.25  # fp16 ulp at |x|~256 is 0.125; allow 2 ulp for dot-vs-linear accumulation-order noise
 assert (ref8_m - out8_m).abs().max().item() / ref8_m.abs().max().item() < 2e-3
 assert (ref8_m - lin8_m).abs().max().item() / ref8_m.abs().max().item() < 2e-3
 
@@ -1954,6 +1989,144 @@ def test_tp_input_block_transfer() -> None:
                     assert torch.equal(ref, got.cpu()), (mode, blocks, key)
     print("  [OK] TP input-block cross-device transfer")
 
+def test_yarn_big_context_rope_scaling() -> None:
+    """YaRN / Linear / NTK-aware RoPE scaling end-to-end plumbing + big-context chunked (Path 3) attention numerics."""
+    from pygguf_engine import GGUFFile
+    from pygguf_engine.model import RotaryEmbeddingCache
+    from pygguf_engine.kv_cache import LayerKVCache
+
+    # 1) GGUF metadata parsing of {arch}.rope.scaling.* (llama.cpp standard keys)
+    with tempfile.TemporaryDirectory() as tmp:
+        yarn_path = Path(tmp) / "yarn_qwen3.gguf"
+        _build_synthetic_gguf(
+            yarn_path,
+            rope_scaling={
+                "type": "yarn",
+                "factor": 2.0,
+                "orig_ctx_len": 4096,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "ext_factor": 1.0,
+                "attn_factor": 1.14,
+            },
+            context_length=131072,
+        )
+        with GGUFFile(yarn_path) as gf:
+            cfg = gf.build_model_config()
+        assert cfg.rope_scaling_type == "yarn"
+        assert cfg.rope_scaling_factor == 2.0
+        assert cfg.rope_original_context_len == 4096
+        assert cfg.rope_yarn_beta_fast == 32.0
+        assert cfg.rope_yarn_beta_slow == 1.0
+        assert cfg.rope_yarn_ext_factor == 1.0
+        assert abs(cfg.rope_yarn_attn_factor - 1.14) < 1e-6
+        assert cfg.max_context_len == 131072
+
+    # 2) RotaryEmbeddingCache math (linear / ntk-aware / yarn) + YaRN mscale attention factor
+    dev = torch.device("cpu")
+    theta, dim = 10000.0, 128
+    idx = torch.arange(0, dim, 2, dtype=torch.float32)
+    base_inv = 1.0 / (theta ** (idx / dim))
+
+    lin = RotaryEmbeddingCache(dim, theta, True, rope_scaling_type="linear", rope_scaling_factor=2.0)
+    assert torch.allclose(lin._inv_freq(dev), base_inv / 2.0)
+    assert lin.attn_factor == 1.0
+
+    ntk = RotaryEmbeddingCache(dim, theta, True, rope_scaling_type="ntk-aware", rope_scaling_factor=2.0)
+    base_ntk = theta * 2.0 ** (dim / (dim - 2))
+    assert torch.allclose(ntk._inv_freq(dev), 1.0 / (base_ntk ** (idx / dim)))
+    assert ntk.attn_factor == 1.0
+
+    factor, orig = 4.0, 4096
+    yarn = RotaryEmbeddingCache(
+        dim,
+        theta,
+        True,
+        rope_scaling_type="yarn",
+        rope_scaling_factor=factor,
+        rope_original_context_len=orig,
+        rope_yarn_beta_fast=32.0,
+        rope_yarn_beta_slow=1.0,
+    )
+
+    def _corr(rot: float) -> float:
+        return (dim * math.log(orig / (rot * 2 * math.pi))) / (2 * math.log(theta))
+
+    low, high = math.floor(_corr(32.0)), math.ceil(_corr(1.0))
+    ramp = torch.clamp((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low), 0.0, 1.0)
+    expected = (base_inv / factor) * ramp + base_inv * (1.0 - ramp)
+    assert torch.allclose(yarn._inv_freq(dev), expected, atol=1e-7)
+    assert abs(yarn.attn_factor - (1.0 + 0.1 * math.log(factor))) < 1e-6
+    # Tables grow on demand for big contexts (128K+ positions)
+    cos, sin = yarn.ensure_capacity(dev, 65536)
+    assert cos.shape[0] >= 65536 and cos.shape[1] == dim // 2
+
+    # 3) Chunked online-softmax (Path 3) attention matches SDPA reference on quantized KV
+    n_kv, gqa, head_dim = 2, 2, 32
+    n_heads = n_kv * gqa
+    torch.manual_seed(0)
+    cache = LayerKVCache(n_kv_heads=n_kv, head_dim=head_dim, max_seq_len=512, device=dev, kv_dtype="int8")
+    total = 40
+    for t in range(total):
+        cache.append(
+            torch.randn(1, n_kv, 1, head_dim, dtype=torch.float16),
+            torch.randn(1, n_kv, 1, head_dim, dtype=torch.float16),
+            t,
+        )
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn(1, n_heads, 16, head_dim, dtype=torch.float16)
+    out = cache.attend(q, start_pos=0, sm_scale=sm_scale, kv_chunk_size=8)
+    kf, vf = cache.get_dequant_slice(0, total, torch.float32)
+    mask = torch.tril(torch.ones(16, total, dtype=torch.bool))
+    ref = F.scaled_dot_product_attention(
+        q.float(),
+        kf.repeat_interleave(gqa, dim=1),
+        vf.repeat_interleave(gqa, dim=1),
+        attn_mask=mask,
+        scale=sm_scale,
+    )
+    assert (out.float() - ref).abs().max().item() < 2e-2
+
+    # 3b) Short-context SDPA path (enable_gqa) matches repeat_interleave reference
+    q2 = torch.randn(1, n_heads, 6, head_dim, dtype=torch.float16)
+    start2 = total - 6
+    out2 = cache.attend(q2, start_pos=start2, sm_scale=sm_scale)
+    mask2 = torch.arange(total).view(1, -1) <= torch.arange(start2, start2 + 6).view(-1, 1)
+    kf2, vf2 = cache.get_dequant_slice(0, total, q2.dtype)
+    ref2 = F.scaled_dot_product_attention(
+        q2,
+        kf2.repeat_interleave(gqa, dim=1),
+        vf2.repeat_interleave(gqa, dim=1),
+        attn_mask=mask2,
+        scale=sm_scale,
+    )
+    assert (out2.float() - ref2.float()).abs().max().item() < 2e-2
+
+    # 4) End-to-end: tiny YaRN-metadata GGUF loads with parsed scaling config and generates tokens
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "yarn_e2e.gguf"
+        _build_synthetic_gguf(
+            path,
+            rope_scaling={"type": "yarn", "factor": 2.0, "orig_ctx_len": 4096},
+            context_length=8192,
+        )
+        eng = PyGGUFEngine(path, devices=["cpu"], max_context_len=8192, enable_cuda_graph=False)
+        assert eng.config.rope_scaling_type == "yarn"
+        assert eng.config.rope_scaling_factor == 2.0
+        res = eng.generate("Hello world", SamplingConfig(max_tokens=3, temperature=0.0))
+        assert res.completion_tokens >= 1
+        eng_report = eng.vram_report()
+        assert eng_report["rope_scaling_type"] == "yarn"
+        # Projection helper: positive and consistent with actual allocated bytes
+        projected = eng.kv_manager.projected_max_vram_bytes()
+        assert eng_report["kv_cache_max_mib"] > 0
+        assert projected >= eng.kv_manager.allocated_vram_bytes()
+    print(
+        "  [OK] YaRN RoPE scaling (GGUF metadata + inv_freq/mscale) + linear/NTK-aware + "
+        "big-context chunked attention + GQA SDPA verified!"
+    )
+
+
 if __name__ == "__main__":
     print("=== Running PyGGUF Engine Verification Suite ===")
     import os, subprocess, sys
@@ -1968,4 +2141,5 @@ if __name__ == "__main__":
     test_int4_kv_ring_mtp_and_adaptive_depth()
     test_qwen35_hybrid_deltanet_and_ud_quants()
     test_dense_moe_and_openai_server()
+    test_yarn_big_context_rope_scaling()
     print("=== ALL TESTS PASSED ===")

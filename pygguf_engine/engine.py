@@ -231,15 +231,23 @@ def find_ngram_draft(
 
     search_limit = max(0, total - 4096)
     for n in range(min(ngram_max, total // 2), ngram_min - 1, -1):
-        suffix = list(tokens[total - n :])
+        suffix = tokens[total - n :]
         last_tok = suffix[-1]
-        # Reverse scan for fast recency match
+        # Reverse scan for fast recency match (avoids per-position slice allocations)
         for pos in range(total - n - 1, search_limit + n - 2, -1):
-            if tokens[pos] == last_tok and list(tokens[pos - n + 1 : pos + 1]) == suffix:
-                end = min(total - n, pos + 1 + max_draft)
-                draft = list(tokens[pos + 1 : end])
-                if draft:
-                    return draft
+            if tokens[pos] != last_tok:
+                continue
+            ok = True
+            for off in range(1, n):
+                if tokens[pos - off] != suffix[n - 1 - off]:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            end = min(total - n, pos + 1 + max_draft)
+            draft = list(tokens[pos + 1 : end])
+            if draft:
+                return draft
     return []
 
 
@@ -270,6 +278,14 @@ class PyGGUFEngine:
         speculative_ngram: bool = True,
         speculative_max_draft: int = 5,
         model_alias: Optional[str] = None,
+        rope_scaling_type: Optional[Literal["none", "linear", "ntk-aware", "yarn"]] = None,
+        rope_scaling_factor: Optional[float] = None,
+        rope_scaling_original_context_length: Optional[int] = None,
+        rope_yarn_beta_fast: Optional[float] = None,
+        rope_yarn_beta_slow: Optional[float] = None,
+        rope_yarn_ext_factor: Optional[float] = None,
+        rope_yarn_attn_factor: Optional[float] = None,
+        rope_yarn_log_mul: Optional[float] = None,
     ) -> None:
         t0 = time.perf_counter()
         self.gguf_path = Path(gguf_path)
@@ -293,13 +309,36 @@ class PyGGUFEngine:
             self.config: GGUFModelConfig = gf.build_model_config()
             if max_context_len is not None:
                 self.config.max_context_len = max_context_len
+            # Optional RoPE context-extension overrides (otherwise the GGUF's own
+            # `{arch}.rope.scaling.*` metadata, if any, is used verbatim).
+            if rope_scaling_type is not None:
+                self.config.rope_scaling_type = rope_scaling_type
+            if rope_scaling_factor is not None:
+                self.config.rope_scaling_factor = float(rope_scaling_factor)
+            if rope_scaling_original_context_length is not None:
+                self.config.rope_original_context_len = int(rope_scaling_original_context_length)
+            if rope_yarn_beta_fast is not None:
+                self.config.rope_yarn_beta_fast = float(rope_yarn_beta_fast)
+            if rope_yarn_beta_slow is not None:
+                self.config.rope_yarn_beta_slow = float(rope_yarn_beta_slow)
+            if rope_yarn_ext_factor is not None:
+                self.config.rope_yarn_ext_factor = float(rope_yarn_ext_factor)
+            if rope_yarn_attn_factor is not None:
+                self.config.rope_yarn_attn_factor = float(rope_yarn_attn_factor)
+            if rope_yarn_log_mul is not None:
+                self.config.rope_yarn_log_mul = float(rope_yarn_log_mul)
 
             self.model_id = model_alias or self.config.name or self.gguf_path.stem
+            rope_note = ""
+            if getattr(self.config, "rope_scaling_type", "none") != "none" and float(getattr(self.config, "rope_scaling_factor", 1.0) or 1.0) != 1.0:
+                rope_note = f" | RoPE={self.config.rope_scaling_type} x{self.config.rope_scaling_factor:g}"
+                if self.config.rope_scaling_type == "yarn" and self.config.rope_original_context_len:
+                    rope_note += f" (orig {self.config.rope_original_context_len})"
             print(
                 f"[PyGGUF] Architecture={self.config.arch} | Layers={self.config.n_layers} | "
                 f"Hidden={self.config.hidden_size} | Heads={self.config.n_heads}/{self.config.n_kv_heads} | "
                 f"MoE={self.config.is_moe} ({self.config.n_experts}x top-{self.config.n_experts_used}) | "
-                f"MaxCtx={self.config.max_context_len} | KV={kv_dtype}"
+                f"MaxCtx={self.config.max_context_len} | KV={kv_dtype}{rope_note}"
             )
 
             self.tokenizer = GGUFTokenizer(
@@ -436,9 +475,13 @@ class PyGGUFEngine:
             "mtp_kv_window": self.mtp_kv_window,
             "speculative_ngram_default": self.speculative_ngram,
             "max_context_len": self.config.max_context_len,
+            "rope_scaling_type": getattr(self.config, "rope_scaling_type", "none"),
+            "rope_scaling_factor": getattr(self.config, "rope_scaling_factor", 1.0),
+            "rope_original_context_len": getattr(self.config, "rope_original_context_len", 0),
             "kv_dtype": self.kv_dtype,
             "cached_prefix_tokens": len(self.kv_manager.cached_tokens),
             "kv_cache_mib": round(self.kv_manager.allocated_vram_bytes() / (1024**2), 2),
+            "kv_cache_max_mib": round(self.kv_manager.projected_max_vram_bytes() / (1024**2), 2),
             "gpus": gpus,
         }
 

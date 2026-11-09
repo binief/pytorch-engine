@@ -62,21 +62,111 @@ class GGUFRMSNorm(nn.Module):
 
 
 class RotaryEmbeddingCache:
-    """Precomputed RoPE cos/sin table per GPU device supporting both NeoX (split-half) and GGUF-Llama (interleaved)."""
+    """
+    Precomputed RoPE cos/sin table per GPU device supporting both NeoX (split-half) and GGUF-Llama (interleaved).
 
-    def __init__(self, rope_dim: int, rope_theta: float, neox_style: bool) -> None:
+    Also implements context-extension scaling so GGUF checkpoints can run far beyond their trained
+    window (`max_context_len` larger than the checkpoint's native context):
+      - `linear`    — positions divided by `factor` (inv_freq / factor)
+      - `ntk-aware` — base re-scaled as `theta * factor ** (dim / (dim - 2))`
+      - `yarn`      — YaRN ramp (correction dims from `beta_fast`/`beta_slow` around the original
+                      context length) plus the standard `mscale = 1 + 0.1 * ext_factor * log(factor)`
+                      attention-factor, applied by multiplying the softmax scale (`self.attn_factor`).
+    """
+
+    def __init__(
+        self,
+        rope_dim: int,
+        rope_theta: float,
+        neox_style: bool,
+        rope_scaling_type: str = "none",
+        rope_scaling_factor: float = 1.0,
+        rope_original_context_len: int = 0,
+        rope_yarn_beta_fast: float = 32.0,
+        rope_yarn_beta_slow: float = 1.0,
+        rope_yarn_ext_factor: float = 1.0,
+        rope_yarn_attn_factor: float = 0.0,
+        rope_yarn_log_mul: float = 0.1,
+        max_context_len: int = 0,
+    ) -> None:
         self.rope_dim = rope_dim
         self.rope_theta = rope_theta
         self.neox_style = neox_style
+        self.rope_scaling_type = self._normalize_scaling_type(rope_scaling_type)
+        self.rope_scaling_factor = float(rope_scaling_factor) if rope_scaling_factor else 1.0
+        if not math.isfinite(self.rope_scaling_factor) or self.rope_scaling_factor <= 0.0:
+            self.rope_scaling_factor = 1.0
+        self.rope_original_context_len = int(rope_original_context_len or 0)
+        self.rope_yarn_beta_fast = float(rope_yarn_beta_fast) if rope_yarn_beta_fast else 32.0
+        self.rope_yarn_beta_slow = float(rope_yarn_beta_slow) if rope_yarn_beta_slow else 1.0
+        self.rope_yarn_ext_factor = float(rope_yarn_ext_factor) if rope_yarn_ext_factor else 1.0
+        self.rope_yarn_attn_factor = float(rope_yarn_attn_factor) if rope_yarn_attn_factor else 0.0
+        self.rope_yarn_log_mul = float(rope_yarn_log_mul) if rope_yarn_log_mul and rope_yarn_log_mul > 0.0 else 0.1
+        self.max_context_len = int(max_context_len or 0)
+        self.attn_factor = self._compute_attn_factor()
         self._tables_per_dev: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @staticmethod
+    def _normalize_scaling_type(raw: Optional[str]) -> str:
+        stype = (raw or "none").strip().lower().replace("_", "-")
+        if stype in ("", "none", "false", "0"):
+            return "none"
+        if stype in ("linear", "pos-interpolation", "position-interpolation"):
+            return "linear"
+        if stype in ("ntk", "ntk-aware", "ntkaware", "dynamic-ntk"):
+            return "ntk-aware"
+        if stype == "yarn":
+            return "yarn"
+        # Unknown scaling types must not silently lie about positions; fail loudly instead.
+        raise ValueError(f"Unsupported rope scaling type: {raw!r} (expected one of: none, linear, ntk-aware, yarn)")
+
+    def _find_correction_dim(self, num_rotations: float, base: float, max_pos: int) -> float:
+        return (self.rope_dim * math.log(max_pos / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+    def _yarn_original_max_pos(self) -> int:
+        if self.rope_original_context_len > 0:
+            return self.rope_original_context_len
+        if self.max_context_len > 0:
+            return self.max_context_len
+        return 4096
+
+    def _inv_freq(self, device: torch.device) -> torch.Tensor:
+        idx = torch.arange(0, self.rope_dim, 2, device=device, dtype=torch.float32)
+        base = float(self.rope_theta)
+        factor = self.rope_scaling_factor
+        stype = self.rope_scaling_type
+        if stype == "linear" and factor != 1.0:
+            return 1.0 / (base ** (idx / self.rope_dim)) / factor
+        if stype == "ntk-aware" and factor != 1.0:
+            base_ntk = base * (factor ** (self.rope_dim / max(1, self.rope_dim - 2)))
+            return 1.0 / (base_ntk ** (idx / self.rope_dim))
+        inv_freq_orig = 1.0 / (base ** (idx / self.rope_dim))
+        if stype == "yarn" and factor != 1.0:
+            original_max_pos = self._yarn_original_max_pos()
+            low = math.floor(self._find_correction_dim(self.rope_yarn_beta_fast, base, original_max_pos))
+            high = math.ceil(self._find_correction_dim(self.rope_yarn_beta_slow, base, original_max_pos))
+            if high <= low:
+                high = low + 1
+            ramp_idx = torch.arange(0, self.rope_dim // 2, device=device, dtype=torch.float32)
+            ramp = torch.clamp((ramp_idx - float(low)) / float(high - low), 0.0, 1.0)
+            inv_freq_interp = inv_freq_orig / factor
+            return inv_freq_interp * ramp + inv_freq_orig * (1.0 - ramp)
+        return inv_freq_orig
+
+    def _compute_attn_factor(self) -> float:
+        if self.rope_scaling_type == "yarn" and self.rope_scaling_factor > 1.0:
+            if self.rope_yarn_attn_factor > 0.0:
+                return float(self.rope_yarn_attn_factor)
+            ext = self.rope_yarn_ext_factor if self.rope_yarn_ext_factor > 0.0 else 1.0
+            return 1.0 + self.rope_yarn_log_mul * ext * math.log(self.rope_scaling_factor)
+        return 1.0
 
     def ensure_capacity(self, device: torch.device, needed: int) -> Tuple[torch.Tensor, torch.Tensor]:
         cached = self._tables_per_dev.get(device)
         if cached is None or cached[0].shape[0] < needed:
             new_cap = max(8192, ((needed + 4095) // 4096) * 4096)
             with cuda_device_scope(device):
-                idx = torch.arange(0, self.rope_dim, 2, device=device, dtype=torch.float32)
-                inv_freq = 1.0 / (self.rope_theta ** (idx / self.rope_dim))
+                inv_freq = self._inv_freq(device)
                 positions = torch.arange(0, new_cap, device=device, dtype=torch.float32)
                 freqs = torch.outer(positions, inv_freq)
                 cached = (torch.cos(freqs).contiguous(), torch.sin(freqs).contiguous())
@@ -370,10 +460,11 @@ class GGUFAttention(nn.Module):
 
         eff_kv_pos = start_pos if kv_pos is None else kv_pos
         kv_cache.append(k, v, eff_kv_pos, pos_tensor=pos_tensor)
+        # YaRN folds its `mscale` attention factor into the softmax scale (equivalent to scaling `q`).
         attn_out = kv_cache.attend(
             q,
             start_pos=eff_kv_pos,
-            sm_scale=self.sm_scale,
+            sm_scale=self.sm_scale * getattr(self.rope, "attn_factor", 1.0),
             softcap=self.config.attn_logit_softcapping,
             pos_tensor=pos_tensor,
         )
@@ -1467,6 +1558,15 @@ class GGUFTransformerModel(nn.Module):
             rope_dim=config.rope_dim,
             rope_theta=config.rope_theta,
             neox_style=config.rope_neox,
+            rope_scaling_type=config.rope_scaling_type,
+            rope_scaling_factor=config.rope_scaling_factor,
+            rope_original_context_len=config.rope_original_context_len,
+            rope_yarn_beta_fast=config.rope_yarn_beta_fast,
+            rope_yarn_beta_slow=config.rope_yarn_beta_slow,
+            rope_yarn_ext_factor=config.rope_yarn_ext_factor,
+            rope_yarn_attn_factor=config.rope_yarn_attn_factor,
+            rope_yarn_log_mul=config.rope_yarn_log_mul,
+            max_context_len=config.max_context_len,
         )
 
         load_start = time.monotonic()

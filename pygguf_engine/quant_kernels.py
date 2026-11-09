@@ -49,8 +49,7 @@ SUB_5BIT_W4_QTYPES = frozenset(
 
 try:
     import triton
-    import triton.language as triton_lang
-    tl = triton_lang
+    import triton.language as tl
     HAS_TRITON = True
 except ImportError:
     triton = None  # type: ignore[assignment]
@@ -379,7 +378,7 @@ if HAS_TRITON:
 
             w_tile = tl.reshape((q_grp * s - z).to(tl.float16), (BLOCK_N, 64))
             w_tile = tl.where(mask_k64[None, :], w_tile, tl.zeros((1, 1), dtype=tl.float16))
-            acc += tl.dot(a_tile, w_tile.T)
+            acc += tl.dot(a_tile, tl.trans(w_tile))
 
         if HAS_BIAS:
             bias = tl.load(bias_ptr + offs_n64, mask=mask_n, other=0.0).to(tl.float32)
@@ -619,7 +618,7 @@ if HAS_TRITON:
 
             w_tile = tl.reshape(w_grp, (BLOCK_N, 64))
             w_tile = tl.where(mask_k64[None, :], w_tile, tl.zeros((1, 1), dtype=tl.float16))
-            acc += tl.dot(a_tile, w_tile.T)
+            acc += tl.dot(a_tile, tl.trans(w_tile))
 
         if HAS_BIAS:
             bias = tl.load(bias_ptr + offs_n64, mask=mask_n, other=0.0).to(tl.float32)
