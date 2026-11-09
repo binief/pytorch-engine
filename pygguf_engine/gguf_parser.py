@@ -156,6 +156,15 @@ class GGUFModelConfig:
     rope_dim: int = 0
     rope_neox: bool = True
     max_context_len: int = 32768
+    # RoPE context-extension scaling (linear / YaRN / NTK-aware) for running beyond the trained context
+    rope_scaling_type: str = "none"
+    rope_scaling_factor: float = 1.0
+    rope_original_context_len: int = 0
+    rope_yarn_beta_fast: float = 32.0
+    rope_yarn_beta_slow: float = 1.0
+    rope_yarn_ext_factor: float = 1.0
+    rope_yarn_attn_factor: float = 0.0
+    rope_yarn_log_mul: float = 0.1
     # MoE parameters (0 for dense models)
     n_experts: int = 0
     n_experts_used: int = 0
@@ -373,6 +382,16 @@ class GGUFFile:
         rope_dim = int(_get("rope.dimension_count", head_dim))
         max_ctx = int(_get("context_length", 32768))
 
+        # Optional RoPE scaling metadata (llama.cpp keys: {arch}.rope.scaling.*)
+        rope_scaling_type = str(_get("rope.scaling.type", "none") or "none").strip().lower().replace("_", "-")
+        rope_scaling_factor = float(_get("rope.scaling.factor", 1.0) or 1.0)
+        rope_original_context_len = int(_get("rope.scaling.original_context_length", 0) or 0)
+        rope_yarn_beta_fast = float(_get("rope.scaling.yarn_beta_fast", 32.0) or 32.0)
+        rope_yarn_beta_slow = float(_get("rope.scaling.yarn_beta_slow", 1.0) or 1.0)
+        rope_yarn_ext_factor = float(_get("rope.scaling.yarn_ext_factor", 1.0) or 1.0)
+        rope_yarn_attn_factor = float(_get("rope.scaling.yarn_attn_factor", 0.0) or 0.0)
+        rope_yarn_log_mul = float(_get("rope.scaling.yarn_log_mul", 0.1) or 0.1)
+
         # GGUF `llama` uses interleaved/adjacent-pair RoPE because convert_hf_to_gguf permutes Q/K.
         # Qwen2/Qwen3/Qwen3.5/Qwen3.8/Gemma/Phi3 keep HF's NeoX split-half RoPE.
         rope_neox = arch not in ("llama",)
@@ -427,6 +446,14 @@ class GGUFFile:
             rope_dim=rope_dim,
             rope_neox=rope_neox,
             max_context_len=max_ctx,
+            rope_scaling_type=rope_scaling_type,
+            rope_scaling_factor=rope_scaling_factor,
+            rope_original_context_len=rope_original_context_len,
+            rope_yarn_beta_fast=rope_yarn_beta_fast,
+            rope_yarn_beta_slow=rope_yarn_beta_slow,
+            rope_yarn_ext_factor=rope_yarn_ext_factor,
+            rope_yarn_attn_factor=rope_yarn_attn_factor,
+            rope_yarn_log_mul=rope_yarn_log_mul,
             n_experts=n_experts,
             n_experts_used=n_experts_used,
             moe_intermediate_size=moe_ffn,

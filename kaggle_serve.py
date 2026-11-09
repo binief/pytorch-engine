@@ -23,7 +23,9 @@ Usage inside a Kaggle Notebook cell:
         gguf_path=gguf_path,
         hf_tokenizer="Qwen/Qwen3-8B",   # Optional (uses embedded GGUF tokenizer if omitted!)
         max_context_len=65536,          # 64K context with INT8 KV cache
-        kv_dtype="int8",
+        kv_dtype="int8",                # "int4" unlocks 128K-256K+ context
+        # Either the GGUF's own {arch}.rope.scaling.* metadata is used verbatim, or override here:
+        # rope_scaling_type="yarn", rope_scaling_factor=4.0, rope_scaling_original_context_length=16384,
         enable_tunnel=True,             # Exposes public https://....trycloudflare.com/v1
         api_key="kaggle-secret-key",
         background=True,                # Keeps notebook cell non-blocking!
@@ -157,6 +159,14 @@ def launch_kaggle_server(
     mtp_confidence_threshold: float = 0.55,
     mtp_kv_window: Optional[int] = 4096,
     speculative_ngram: bool = True,
+    rope_scaling_type: Optional[Literal["none", "linear", "ntk-aware", "yarn"]] = None,
+    rope_scaling_factor: Optional[float] = None,
+    rope_scaling_original_context_length: Optional[int] = None,
+    rope_yarn_beta_fast: Optional[float] = None,
+    rope_yarn_beta_slow: Optional[float] = None,
+    rope_yarn_ext_factor: Optional[float] = None,
+    rope_yarn_attn_factor: Optional[float] = None,
+    rope_yarn_log_mul: Optional[float] = None,
     host: str = "0.0.0.0",
     port: int = 8000,
     api_key: Optional[str] = None,
@@ -198,6 +208,14 @@ def launch_kaggle_server(
         mtp_kv_window=mtp_kv_window,
         speculative_ngram=speculative_ngram,
         model_alias=model_alias,
+        rope_scaling_type=rope_scaling_type,
+        rope_scaling_factor=rope_scaling_factor,
+        rope_scaling_original_context_length=rope_scaling_original_context_length,
+        rope_yarn_beta_fast=rope_yarn_beta_fast,
+        rope_yarn_beta_slow=rope_yarn_beta_slow,
+        rope_yarn_ext_factor=rope_yarn_ext_factor,
+        rope_yarn_attn_factor=rope_yarn_attn_factor,
+        rope_yarn_log_mul=rope_yarn_log_mul,
     )
     app = create_openai_app(engine, api_key=api_key, include_reasoning=include_reasoning)
     uv_cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
@@ -304,6 +322,15 @@ def main() -> None:
     )
     parser.add_argument("--cpu-threads", type=int, default=None, help="PyTorch CPU intra-op threads (process-wide; default: unchanged)")
     parser.add_argument("--no-cuda-graph", action="store_true", help="Disable CUDAGraph capture for M=1 decode")
+    parser.add_argument("--rope-scaling-type", choices=["none", "linear", "ntk-aware", "yarn"], default=None,
+                        help="Override RoPE scaling from GGUF metadata (extend context beyond trained length)")
+    parser.add_argument("--rope-scaling-factor", type=float, default=None, help="RoPE scaling factor, e.g. 2.0/4.0/8.0 for YaRN")
+    parser.add_argument("--rope-scaling-orig-ctx", type=int, default=None, help="Original (pre-extension) context length for YaRN correction dims, e.g. 32768")
+    parser.add_argument("--rope-yarn-beta-fast", type=float, default=None, help="YaRN beta_fast (default: 32.0)")
+    parser.add_argument("--rope-yarn-beta-slow", type=float, default=None, help="YaRN beta_slow (default: 1.0)")
+    parser.add_argument("--rope-yarn-ext-factor", type=float, default=None, help="YaRN ext_factor for the mscale attention factor (default: 1.0)")
+    parser.add_argument("--rope-yarn-attn-factor", type=float, default=None, help="Override YaRN attention (mscale) factor explicitly (default: auto = 1 + log_mul * ext_factor * log(factor))")
+    parser.add_argument("--rope-yarn-log-mul", type=float, default=None, help="YaRN mscale log-multiplier (default: 0.1)")
     args = parser.parse_args()
 
     if args.gguf:
@@ -333,6 +360,14 @@ def main() -> None:
         mtp_confidence_threshold=args.mtp_conf_threshold,
         mtp_kv_window=args.mtp_kv_window,
         speculative_ngram=(not args.no_ngram) and (not args.no_speculative),
+        rope_scaling_type=args.rope_scaling_type,
+        rope_scaling_factor=args.rope_scaling_factor,
+        rope_scaling_original_context_length=args.rope_scaling_orig_ctx,
+        rope_yarn_beta_fast=args.rope_yarn_beta_fast,
+        rope_yarn_beta_slow=args.rope_yarn_beta_slow,
+        rope_yarn_ext_factor=args.rope_yarn_ext_factor,
+        rope_yarn_attn_factor=args.rope_yarn_attn_factor,
+        rope_yarn_log_mul=args.rope_yarn_log_mul,
         port=args.port,
         api_key=args.api_key,
         enable_tunnel=args.tunnel,
