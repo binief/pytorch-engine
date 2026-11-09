@@ -438,12 +438,22 @@ def create_openai_app(
                     "created": now,
                     "model": model_name,
                     "choices": [],
-                    "usage": {
-                        "prompt_tokens": final_stats.prompt_tokens,
-                        "completion_tokens": final_stats.completion_tokens,
-                        "total_tokens": final_stats.prompt_tokens + final_stats.completion_tokens,
-                    },
-                }
+                        "usage": {
+                            "prompt_tokens": final_stats.prompt_tokens,
+                            "completion_tokens": final_stats.completion_tokens,
+                            "total_tokens": final_stats.prompt_tokens + final_stats.completion_tokens,
+                        },
+                        "timings": {
+                            "prompt_per_second": round(final_stats.prompt_tok_per_s, 2),
+                            "predicted_per_second": round(final_stats.decode_tok_per_s, 2),
+                            "prefill_ms": round(final_stats.prefill_time_s * 1000, 2),
+                            "decode_ms": round(final_stats.decode_time_s * 1000, 2),
+                            "speculative_accepted": final_stats.speculative_accepted,
+                            "speculative_drafted": final_stats.speculative_drafted,
+                            "mtp_accepted": final_stats.mtp_accepted,
+                            "mtp_drafted": final_stats.mtp_drafted,
+                        },
+                    }
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
 
             yield "data: [DONE]\n\n"
