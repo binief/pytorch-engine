@@ -481,6 +481,7 @@ class PyGGUFEngine:
             "kv_dtype": self.kv_dtype,
             "cached_prefix_tokens": len(self.kv_manager.cached_tokens),
             "kv_cache_mib": round(self.kv_manager.allocated_vram_bytes() / (1024**2), 2),
+            "kv_cache_max_mib": round(self.kv_manager.projected_max_vram_bytes() / (1024**2), 2),
             "gpus": gpus,
         }
 

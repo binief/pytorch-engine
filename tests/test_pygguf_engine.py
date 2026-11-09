@@ -2117,6 +2117,10 @@ def test_yarn_big_context_rope_scaling() -> None:
         assert res.completion_tokens >= 1
         eng_report = eng.vram_report()
         assert eng_report["rope_scaling_type"] == "yarn"
+        # Projection helper: positive and consistent with actual allocated bytes
+        projected = eng.kv_manager.projected_max_vram_bytes()
+        assert eng_report["kv_cache_max_mib"] > 0
+        assert projected >= eng.kv_manager.allocated_vram_bytes()
     print(
         "  [OK] YaRN RoPE scaling (GGUF metadata + inv_freq/mscale) + linear/NTK-aware + "
         "big-context chunked attention + GQA SDPA verified!"

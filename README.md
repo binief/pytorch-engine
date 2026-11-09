@@ -40,6 +40,8 @@ YaRN also folds its `mscale` attention factor into the softmax scale, including 
 scaling (no mscale) are supported too, and unknown scaling types raise a loud error instead of
 silently corrupting positions. RoPE tables grow on demand (up to the configured `max_context_len`).
 
+`vram_report()` includes `kv_cache_mib` (current) and `kv_cache_max_mib` (projected at full `max_context_len`) — check the latter before picking a context length for your T4.
+
 Equivalent CLI flags on `kaggle_serve.py`: `--rope-scaling-type yarn --rope-scaling-factor 4.0
 --rope-scaling-orig-ctx 32768 [--rope-yarn-attn-factor X] [--rope-yarn-log-mul 0.1]`.
 

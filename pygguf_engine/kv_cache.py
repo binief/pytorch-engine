@@ -2314,3 +2314,21 @@ class EngineKVCacheManager:
         for _key, st in self._iter_all_recurrent_states():
             total += st.allocated_bytes()
         return total
+
+    def projected_max_vram_bytes(self) -> int:
+        """Exact bytes the KV buffers would occupy at their configured full capacity
+        (non-ring layers: `max_seq_len`; sliding-window layers: their ring cap).
+        Does NOT allocate anything; recurrent-state bytes are counted as already allocated."""
+        total = 0
+        for lkv in self._iter_all_kv_caches() + self._iter_mtp_kv_caches():
+            cap = lkv._ring_cap if lkv._ring_cap is not None else lkv.max_seq_len
+            if lkv.kv_dtype == "int4":
+                per_pos_per_head = lkv.head_dim + 8  # K+V int4 packed nibbles + fp16 K/V scales
+            elif lkv.kv_dtype == "int8":
+                per_pos_per_head = 2 * lkv.head_dim + 4  # K+V int8 + fp16 K/V scales
+            else:
+                per_pos_per_head = 4 * lkv.head_dim  # K+V fp16
+            total += cap * lkv.n_kv_heads * per_pos_per_head
+        for _key, st in self._iter_all_recurrent_states():
+            total += st.allocated_bytes()
+        return total
