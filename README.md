@@ -54,6 +54,26 @@ Equivalent CLI flags on `kaggle_serve.py`: `--rope-scaling-type yarn --rope-scal
 - **Zero-cost N-gram self-speculative decoding** + optional GGUF `draft-mtp` head with adaptive depth.
 - **Prefix KV cache reuse** across multi-turn requests and a GPU-resident top-k/top-p/min-p/repetition-penalty sampler (single sync per token).
 
+## Dual-T4 tok/s notes
+
+Measured on dual-T4 with `unsloth/Qwen3.8-27B-UD-Q4_K_M` (hybrid 48× GatedDeltaNet + 16× FullAttention),
+`max_context_len=65536`, `kv_dtype="int8"`, thinking on, short notebook test prompt:
+
+- `parallel_mode="auto"` (→ TP=2) + `speculative_mtp=True` (`mtp_draft_tokens=2`) → **4.9 e2e tok/s** (llama.cpp: 20 tok/s).
+  Eager hybrid decode is Python-dispatch-bound: TP bypasses the per-stage CUDA-graph capture, and the M=3 verify
+  pass bypasses it too, so every token pays thousands of Python kernel launches + cross-GPU activation copies.
+- Fastest known PyGGUF recipe for this workload: `parallel_mode="pp"` (per-stage CUDA graphs for M=1) with speculation
+  off (`speculative_mtp=False` and `speculative_ngram=False`) — every step replays a captured graph with zero
+  all-reduce and no Python dispatch. Trade-off: prefill is kernel-bound ~2x slower than TP on PP.
+- With `speculative_mtp=True`, both verify passes (`S >= 2`) run eagerly; on dispatch-bound hardware the draft
+  overhead can outweigh its gains. Watch `timings.predicted_per_second` and `timings.mtp_accepted/mtp_drafted`
+  (exposed both in sync responses and in the streaming `include_usage` final chunk under `timings`).
+
+A/B from a notebook cell:
+`client.chat.completions.create(..., stream=False, extra_body={"speculative_mtp": False, "speculative_ngram": False})`
+and compare `resp["timings"]["predicted_per_second"]` against the speculative run. TP remains the right choice for
+prefill-heavy / large-batch prompts; it is not dispatch-bound there.
+
 ## Tests
 
 Install dependencies including torch, triton, numpy, gguf, fastapi, httpx, jinja2, tokenizers and pydantic, then run:
