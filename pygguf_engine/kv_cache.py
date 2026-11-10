@@ -139,20 +139,26 @@ if HAS_TRITON:
         vs_ptr,
         part_out_ptr,
         part_lse_ptr,
-        pos_ptr,        # int32[1] GPU scalar (`cur_pos`, so `total_len = cur_pos + 1`)
+        pos_ptr,        # int32[1] GPU scalar (`cur_pos`, the chunk base position)
         capacity,
         sm_scale,
         GQA_GROUP: tl.constexpr,
         NUM_SPLITS: tl.constexpr,
         BLOCK_S: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        Q_LEN: tl.constexpr = 1,
     ):
-        """CUDA-Graph-capturable Split-KV INT8 Flash-Decoding reading `total_len` from GPU `pos_ptr`."""
+        """CUDA-Graph-capturable Split-KV INT8 Flash-Decoding reading positions from GPU `pos_ptr`.
+
+        `Q_LEN` queries share one captured graph (`q` rows are laid out `[head, q_row]`); query row
+        `r` attends the causal prefix `[0, cur_pos + 1 + r)` (`Q_LEN == 1` reduces to the old path).
+        """
         head_idx = tl.program_id(0)
         split_idx = tl.program_id(1)
-        kv_head = head_idx // GQA_GROUP
+        q_row = head_idx % Q_LEN
+        kv_head = (head_idx // Q_LEN) // GQA_GROUP
 
-        total_len = tl.load(pos_ptr).to(tl.int32) + 1
+        total_len = tl.load(pos_ptr).to(tl.int32) + 1 + q_row
         tokens_per_split = (total_len + NUM_SPLITS - 1) // NUM_SPLITS
         split_start = split_idx * tokens_per_split
         split_end = tl.minimum(total_len, split_start + tokens_per_split)
@@ -294,17 +300,23 @@ if HAS_TRITON:
         v_buf_ptr,
         ks_buf_ptr,
         vs_buf_ptr,
-        pos_ptr,        # int32[1] GPU scalar (`start_pos`)
+        pos_ptr,        # int32[1] GPU scalar (`start_pos`, chunk base position)
         capacity,
         HEAD_DIM: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        S_NEW: tl.constexpr = 1,
     ):
-        """CUDA-Graph-capturable single-token (`s_new=1`) INT8 KV cache writer."""
+        """CUDA-Graph-capturable INT8 KV cache writer (launch with grid `(n_kv_heads, S_NEW)`).
+
+        Row `pid_s` of the chunk is written at `load(pos_ptr) + pid_s` (`S_NEW == 1` reduces to
+        the old single-token writer exactly).
+        """
         pid_h = tl.program_id(0)
+        pid_s = tl.program_id(1)
         offs_d = tl.arange(0, BLOCK_D)
         mask_d = offs_d < HEAD_DIM
 
-        in_off = pid_h.to(tl.int64) * HEAD_DIM + offs_d
+        in_off = (pid_h.to(tl.int64) * S_NEW + pid_s) * HEAD_DIM + offs_d
         k_val = tl.load(k_in_ptr + in_off, mask=mask_d, other=0.0).to(tl.float32)
         v_val = tl.load(v_in_ptr + in_off, mask=mask_d, other=0.0).to(tl.float32)
 
@@ -322,7 +334,7 @@ if HAS_TRITON:
         kq_i8 = tl.minimum(tl.maximum(kq, -127.0), 127.0).to(tl.int8)
         vq_i8 = tl.minimum(tl.maximum(vq, -127.0), 127.0).to(tl.int8)
 
-        dst_pos = tl.load(pos_ptr).to(tl.int64)
+        dst_pos = tl.load(pos_ptr).to(tl.int64) + pid_s
         out_off = (pid_h.to(tl.int64) * capacity + dst_pos) * HEAD_DIM + offs_d
         scale_off = pid_h.to(tl.int64) * capacity + dst_pos
 
@@ -399,17 +411,23 @@ if HAS_TRITON:
         v_buf_ptr,
         ks_buf_ptr,
         vs_buf_ptr,
-        pos_ptr,        # int32[1] GPU scalar (`start_pos`)
+        pos_ptr,        # int32[1] GPU scalar (`start_pos`, chunk base position)
         capacity,
         HALF_D: tl.constexpr,
         BLOCK_HD: tl.constexpr,
+        S_NEW: tl.constexpr = 1,
     ):
-        """CUDA-Graph-capturable single-token (`s_new=1`) INT4 KV cache writer."""
+        """CUDA-Graph-capturable INT4 KV cache writer (launch with grid `(n_kv_heads, S_NEW)`).
+
+        Row `pid_s` of the chunk is written at `load(pos_ptr) + pid_s` (`S_NEW == 1` reduces to
+        the old single-token writer exactly).
+        """
         pid_h = tl.program_id(0)
+        pid_s = tl.program_id(1)
         offs_hd = tl.arange(0, BLOCK_HD)
         mask_hd = offs_hd < HALF_D
 
-        in_base = pid_h.to(tl.int64) * (2 * HALF_D)
+        in_base = (pid_h.to(tl.int64) * S_NEW + pid_s) * (2 * HALF_D)
         k_lo = tl.load(k_in_ptr + in_base + offs_hd, mask=mask_hd, other=0.0).to(tl.float32)
         k_hi = tl.load(k_in_ptr + in_base + HALF_D + offs_hd, mask=mask_hd, other=0.0).to(tl.float32)
         v_lo = tl.load(v_in_ptr + in_base + offs_hd, mask=mask_hd, other=0.0).to(tl.float32)
@@ -433,7 +451,7 @@ if HAS_TRITON:
         kp_u8 = ((qk_lo & 0x0F) | ((qk_hi & 0x0F) << 4)).to(tl.uint8)
         vp_u8 = ((qv_lo & 0x0F) | ((qv_hi & 0x0F) << 4)).to(tl.uint8)
 
-        dst_pos = tl.load(pos_ptr).to(tl.int64)
+        dst_pos = tl.load(pos_ptr).to(tl.int64) + pid_s
         slot_idx = pid_h.to(tl.int64) * capacity + dst_pos
         out_off = slot_idx * HALF_D + offs_hd
         sc_off = slot_idx * 2
@@ -570,20 +588,26 @@ if HAS_TRITON:
         vs_ptr,
         part_out_ptr,
         part_lse_ptr,
-        pos_ptr,        # int32[1] GPU scalar (`cur_pos`, so `total_len = cur_pos + 1`)
+        pos_ptr,        # int32[1] GPU scalar (`cur_pos`, the chunk base position)
         capacity,
         sm_scale,
         GQA_GROUP: tl.constexpr,
         NUM_SPLITS: tl.constexpr,
         BLOCK_S: tl.constexpr,
         HALF_D: tl.constexpr,
+        Q_LEN: tl.constexpr = 1,
     ):
-        """CUDA-Graph-capturable Split-KV INT4 Flash-Decoding reading `total_len` from GPU `pos_ptr`."""
+        """CUDA-Graph-capturable Split-KV INT4 Flash-Decoding reading positions from GPU `pos_ptr`.
+
+        `Q_LEN` queries share one captured graph (`q` rows are laid out `[head, q_row]`); query row
+        `r` attends the causal prefix `[0, cur_pos + 1 + r)` (`Q_LEN == 1` reduces to the old path).
+        """
         head_idx = tl.program_id(0)
         split_idx = tl.program_id(1)
-        kv_head = head_idx // GQA_GROUP
+        q_row = head_idx % Q_LEN
+        kv_head = (head_idx // Q_LEN) // GQA_GROUP
 
-        total_len = tl.load(pos_ptr).to(tl.int32) + 1
+        total_len = tl.load(pos_ptr).to(tl.int32) + 1 + q_row
         tokens_per_split = (total_len + NUM_SPLITS - 1) // NUM_SPLITS
         split_start = split_idx * tokens_per_split
         split_end = tl.minimum(total_len, split_start + tokens_per_split)
@@ -1256,6 +1280,9 @@ class LayerRecurrentState:
         self.conv_state: Optional[torch.Tensor] = None  # float32 [1, conv_dim, conv_kernel - 1]
         self.ssm_state: Optional[torch.Tensor] = None   # float32 [num_v_heads, head_v_dim, head_k_dim]
         self.verify_active: bool = False
+        # When an S>1 verify CUDA graph is captured, holds permanent references to the graph-owned
+        # verify-cache buffers so `begin_recurrent_verify()` can re-point `_verify_cache` at them.
+        self._graph_verify_cache: Optional[Tuple[torch.Tensor, ...]] = None
         self._verify_cache: Optional[
             Tuple[
                 torch.Tensor,  # pre_ssm_state [H_v, D_v, D_k]
@@ -1411,6 +1438,8 @@ class LayerKVCache:
         self.k_scale: Optional[torch.Tensor] = None
         self.v_scale: Optional[torch.Tensor] = None
         self._part_out_scratch: Optional[torch.Tensor] = None
+        self._graph_scratch_out: Optional[torch.Tensor] = None
+        self._graph_scratch_lse: Optional[torch.Tensor] = None
         self._part_lse_scratch: Optional[torch.Tensor] = None
 
     def _ensure_capacity(self, needed_len: int) -> None:
@@ -1504,8 +1533,8 @@ class LayerKVCache:
                     k_c = k_s.to(device=dev, dtype=torch.float16).contiguous()
                     v_c = v_s.to(device=dev, dtype=torch.float16).contiguous()
                     BLOCK_HD = triton.next_power_of_2(max(16, half_d))
-                    if pos_tensor is not None and s_chunk == 1:
-                        _kv_append_int4_posptr_kernel[(self.n_kv_heads,)](
+                    if pos_tensor is not None:
+                        _kv_append_int4_posptr_kernel[(self.n_kv_heads, s_chunk)](
                             k_c,
                             v_c,
                             self.k_buf,
@@ -1516,6 +1545,7 @@ class LayerKVCache:
                             self.capacity,
                             HALF_D=half_d,
                             BLOCK_HD=BLOCK_HD,
+                            S_NEW=s_chunk,
                             num_warps=2,
                         )
                     else:
@@ -1550,12 +1580,14 @@ class LayerKVCache:
                 vp = (_q4_u8(v_lo, vs_lo) | (_q4_u8(v_hi, vs_hi) << 4)).to(torch.uint8)
                 ks_pair = torch.cat([ks_lo, ks_hi], dim=-1)
                 vs_pair = torch.cat([vs_lo, vs_hi], dim=-1)
-                if pos_tensor is not None and s_chunk == 1:
-                    idx64 = pos_tensor.to(torch.long)
-                    self.k_buf.index_copy_(1, idx64, kp)
-                    self.v_buf.index_copy_(1, idx64, vp)
-                    self.k_scale.index_copy_(1, idx64, ks_pair)
-                    self.v_scale.index_copy_(1, idx64, vs_pair)
+                if pos_tensor is not None:
+                    pos_vec = pos_tensor.to(torch.long).view(1) + torch.arange(
+                        s_chunk, device=self.k_buf.device, dtype=torch.long
+                    )
+                    self.k_buf.index_copy_(1, pos_vec, kp)
+                    self.v_buf.index_copy_(1, pos_vec, vp)
+                    self.k_scale.index_copy_(1, pos_vec, ks_pair)
+                    self.v_scale.index_copy_(1, pos_vec, vs_pair)
                 else:
                     self.k_buf[:, dst_pos:end_pos, :] = kp
                     self.v_buf[:, dst_pos:end_pos, :] = vp
@@ -1569,8 +1601,8 @@ class LayerKVCache:
                     k_c = k_s.to(device=dev, dtype=torch.float16).contiguous()
                     v_c = v_s.to(device=dev, dtype=torch.float16).contiguous()
                     BLOCK_D = triton.next_power_of_2(self.head_dim)
-                    if pos_tensor is not None and s_chunk == 1:
-                        _kv_append_int8_posptr_kernel[(self.n_kv_heads,)](
+                    if pos_tensor is not None:
+                        _kv_append_int8_posptr_kernel[(self.n_kv_heads, s_chunk)](
                             k_c,
                             v_c,
                             self.k_buf,
@@ -1581,6 +1613,7 @@ class LayerKVCache:
                             self.capacity,
                             HEAD_DIM=self.head_dim,
                             BLOCK_D=BLOCK_D,
+                            S_NEW=s_chunk,
                             num_warps=2,
                         )
                     else:
@@ -1598,6 +1631,20 @@ class LayerKVCache:
                             BLOCK_D=BLOCK_D,
                             num_warps=2,
                         )
+            elif pos_tensor is not None:
+                k_amax = k_s.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+                v_amax = v_s.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+                ks = (k_amax / 127.0).to(torch.float16)
+                vs = (v_amax / 127.0).to(torch.float16)
+                kq = torch.round(k_s / ks).clamp(-127, 127).to(torch.int8)
+                vq = torch.round(v_s / vs).clamp(-127, 127).to(torch.int8)
+                pos_vec = pos_tensor.to(torch.long).view(1) + torch.arange(
+                    s_chunk, device=self.k_buf.device, dtype=torch.long
+                )
+                self.k_buf.index_copy_(1, pos_vec, kq)
+                self.v_buf.index_copy_(1, pos_vec, vq)
+                self.k_scale.index_copy_(1, pos_vec, ks.squeeze(-1))
+                self.v_scale.index_copy_(1, pos_vec, vs.squeeze(-1))
             else:
                 k_amax = k_s.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
                 v_amax = v_s.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
@@ -1608,10 +1655,12 @@ class LayerKVCache:
                 self.k_scale[:, dst_pos:end_pos] = ks.squeeze(-1)
                 self.v_scale[:, dst_pos:end_pos] = vs.squeeze(-1)
         else:
-            if pos_tensor is not None and s_chunk == 1:
-                idx64 = pos_tensor.to(torch.long)
-                self.k_buf.index_copy_(1, idx64, k_s.to(torch.float16))
-                self.v_buf.index_copy_(1, idx64, v_s.to(torch.float16))
+            if pos_tensor is not None:
+                pos_vec = pos_tensor.to(torch.long).view(1) + torch.arange(
+                    s_chunk, device=self.k_buf.device, dtype=torch.long
+                )
+                self.k_buf.index_copy_(1, pos_vec, k_s.to(torch.float16))
+                self.v_buf.index_copy_(1, pos_vec, v_s.to(torch.float16))
             else:
                 self.k_buf[:, dst_pos:end_pos, :] = k_s.to(torch.float16)
                 self.v_buf[:, dst_pos:end_pos, :] = v_s.to(torch.float16)
@@ -1625,7 +1674,8 @@ class LayerKVCache:
     ) -> int:
         """
         Append `k_new`, `v_new` of shape `[1, n_kv_heads, S_new, head_dim]` at `start_pos`.
-        When `pos_tensor` (`int32[1]` on GPU) is supplied (`s_new == 1`), uses CUDA-Graph-safe GPU indexing!
+        When `pos_tensor` (`int32[1]` on GPU) is supplied, the write offsets are derived on-GPU
+        from `pos_tensor` (`base + row`), making the path CUDA-Graph-capturable for any `S_new`.
         When `sliding_window` is configured, wraps writes into the bounded ring buffer (`O(W)` VRAM).
         """
         s_new = int(k_new.shape[2])
@@ -1734,7 +1784,7 @@ class LayerKVCache:
         """
         Compute GQA causal attention for `q` `[1, n_heads, q_len, head_dim]`.
         Uses:
-          1. Fused Split-KV INT4 / INT8 attention for up to 8 queries (GPU position pointers: single query)
+          1. Fused Split-KV INT4 / INT8 attention for up to 8 queries (GPU position pointers read the chunk base position)
           2. PyTorch SDPA fast path when `eff_len <= kv_chunk_size` and `softcap == 0`
           3. Online-Softmax Chunked Attention for ultra-long contexts (32K-256K+) so VRAM never spikes!
         """
@@ -1760,8 +1810,17 @@ class LayerKVCache:
             and q.is_cuda
             and self.kv_dtype in ("int4", "int8")
             and 1 <= q_len <= 8
-            and (q_len == 1 or (pos_tensor is None and start_pos + q_len == end_pos
-                                  and (not is_ring or self.capacity >= self.sliding_window + q_len - 1)))
+            and (
+                (pos_tensor is not None and not is_ring and q_len <= 8)
+                or (
+                    pos_tensor is None
+                    and (
+                        q_len == 1
+                        or (start_pos + q_len == end_pos
+                            and (not is_ring or self.capacity >= self.sliding_window + q_len - 1))
+                    )
+                )
+            )
             and softcap == 0.0
             and is_pow2_hd
             and (pos_tensor is not None or total_len >= 1)
@@ -1783,15 +1842,25 @@ class LayerKVCache:
                 block_s = 32 if head_dim >= 256 else 64
 
                 rows = n_heads * q_len
-                if (self._part_out_scratch is None
-                    or self._part_out_scratch.shape != (rows, num_splits, head_dim)):
-                    # Kernels index with NUM_SPLITS as the row stride: sliced
-                    # 32-wide buffers are not contiguous for fewer splits.
-                    self._part_out_scratch = torch.empty((rows, num_splits, head_dim), device=dev, dtype=torch.float32)
-                    self._part_lse_scratch = torch.empty((rows, num_splits), device=dev, dtype=torch.float32)
-                assert self._part_lse_scratch is not None
-                part_out = self._part_out_scratch
-                part_lse = self._part_lse_scratch
+                if pos_tensor is not None:
+                    # Graph-reserved scratch: ONE max-size buffer per layer shared by every captured
+                    # S=1..8 graph (dim-0 slicing stays contiguous for any row count). Allocated during
+                    # capture setup so graph capture never allocates.
+                    if self._graph_scratch_out is None or self._graph_scratch_out.shape[0] < rows:
+                        self._graph_scratch_out = torch.empty((n_heads * 8, 32, head_dim), device=dev, dtype=torch.float32)
+                        self._graph_scratch_lse = torch.empty((n_heads * 8, 32), device=dev, dtype=torch.float32)
+                    assert self._graph_scratch_lse is not None
+                    part_out = self._graph_scratch_out[:rows]
+                    part_lse = self._graph_scratch_lse[:rows]
+                else:
+                    if (self._part_out_scratch is None
+                        or self._part_out_scratch.shape != (rows, num_splits, head_dim)):
+                        # Kernels index with NUM_SPLITS as the row stride: sliced
+                        # 32-wide buffers are not contiguous for fewer splits.
+                        self._part_out_scratch = torch.empty((rows, num_splits, head_dim), device=dev, dtype=torch.float32)
+                        self._part_lse_scratch = torch.empty((rows, num_splits), device=dev, dtype=torch.float32)
+                    part_out = self._part_out_scratch
+                    part_lse = self._part_lse_scratch
 
                 q_contig = q.to(device=dev, dtype=torch.float16).contiguous().view(rows, head_dim)
                 grid = (rows, num_splits)
@@ -1813,6 +1882,7 @@ class LayerKVCache:
                             NUM_SPLITS=num_splits,
                             BLOCK_S=block_s,
                             HALF_D=half_d,
+                            Q_LEN=q_len,
                             num_warps=4,
                         )
                     else:
@@ -1854,6 +1924,7 @@ class LayerKVCache:
                             NUM_SPLITS=num_splits,
                             BLOCK_S=block_s,
                             HEAD_DIM=head_dim,
+                            Q_LEN=q_len,
                             num_warps=4,
                         )
                     else:
@@ -2224,7 +2295,12 @@ class EngineKVCacheManager:
             return
         for _key, st in self._iter_all_recurrent_states():
             st.verify_active = True
-            st._verify_cache = None
+            if getattr(st, "_graph_verify_cache", None) is not None:
+                # Verify CUDA-graph mode (`forward_verify_step`): the captured graph rewrites the
+                # fixed verify-cache buffers on every replay; re-point at them instead of dropping them.
+                st._verify_cache = st._graph_verify_cache
+            else:
+                st._verify_cache = None
 
     def commit_recurrent_verify(self, start_pos: int, n_keep: int) -> bool:
         """

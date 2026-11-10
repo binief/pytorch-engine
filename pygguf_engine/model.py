@@ -180,11 +180,19 @@ class RotaryEmbeddingCache:
         seq_len: int,
         pos_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if pos_tensor is not None and seq_len == 1:
-            cached = self._tables_per_dev[device]
-            idx64 = pos_tensor.to(torch.long)
-            cos = cached[0].index_select(0, idx64).view(1, 1, 1, -1)
-            sin = cached[1].index_select(0, idx64).view(1, 1, 1, -1)
+        if pos_tensor is not None:
+            # CUDA-graph-safe positions: `pos_tensor` (`int32[1]`) holds the chunk base position;
+            # row `i` of a multi-token chunk sits at `base + i` (S=1 reduces to the old path exactly).
+            cached = self._tables_per_dev.get(device)
+            if cached is None:
+                cached = self.ensure_capacity(device, self.max_context_len if self.max_context_len > 0 else 8192)
+            base = pos_tensor.to(torch.long).view(1)
+            if seq_len == 1:
+                full_idx = base
+            else:
+                full_idx = base + torch.arange(seq_len, device=base.device, dtype=torch.long)
+            cos = cached[0].index_select(0, full_idx).view(1, seq_len, 1, -1)
+            sin = cached[1].index_select(0, full_idx).view(1, seq_len, 1, -1)
             return cos, sin
 
         needed = start_pos + seq_len
@@ -1682,6 +1690,20 @@ class GGUFTransformerModel(nn.Module):
         self._stage_in_bufs: List[torch.Tensor] = []
         self._stage_out_bufs: List[torch.Tensor] = []
         self._stage_pos_bufs: Dict[torch.device, torch.Tensor] = {}
+        # Per-S CUDA Graph state for S=2..8 verify steps (speculative decode). Buffers are created
+        # once per S and shared by every capture; they must survive M=1 re-captures, so they are
+        # never recreated — hence dedicated pos/token bufs (the M=1 capture recreates its own).
+        self._verify_graphs_failed = False
+        self._verify_token_bufs: Dict[int, torch.Tensor] = {}
+        self._verify_pos_bufs: Dict[torch.device, torch.Tensor] = {}
+        self._verify_stage_data: Dict[
+            int, Tuple[List[Tuple[torch.device, int, int]], List[Any], List[torch.Tensor], List[torch.Tensor]]
+        ] = {}
+        self._verify_head_data: Dict[
+            int, Tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._verify_graph_caps: Dict[int, Tuple[int, ...]] = {}
+        self._verify_graphs_ready: Dict[int, bool] = {}
         self._graph_token_buf: Optional[torch.Tensor] = None
         self._graph_logits_buf: Optional[torch.Tensor] = None
         self._graph_normed_buf: Optional[torch.Tensor] = None
@@ -1735,11 +1757,15 @@ class GGUFTransformerModel(nn.Module):
             else:
                 lkv = kv_manager.layers[idx]
                 assert lkv is not None
-                if lkv._part_out_scratch is None:
-                    with cuda_device_scope(lkv.device):
-                        n_h = blk.attn.n_heads  # type: ignore[attr-defined]
+                n_h = blk.attn.n_heads  # type: ignore[attr-defined]
+                with cuda_device_scope(lkv.device):
+                    if lkv._part_out_scratch is None:
                         lkv._part_out_scratch = torch.empty((n_h, 32, lkv.head_dim), device=lkv.device, dtype=torch.float32)
                         lkv._part_lse_scratch = torch.empty((n_h, 32), device=lkv.device, dtype=torch.float32)
+                    if lkv._graph_scratch_out is None:
+                        hd = lkv.head_dim
+                        lkv._graph_scratch_out = torch.empty((n_h * 8, 32, hd), device=lkv.device, dtype=torch.float32)
+                        lkv._graph_scratch_lse = torch.empty((n_h * 8, 32), device=lkv.device, dtype=torch.float32)
 
         with cuda_device_scope(self.first_device):
             self._graph_token_buf = torch.zeros((1, 1), device=self.first_device, dtype=torch.long)
@@ -1893,6 +1919,256 @@ class GGUFTransformerModel(nn.Module):
             assert self._graph_normed_buf is not None
             return self._graph_logits_buf, self._graph_normed_buf
         return self._graph_logits_buf
+
+    def _verify_graph_eligibility(self, kv_manager: EngineKVCacheManager) -> Tuple[bool, str]:
+        """
+        Verify CUDA graphs (`S=2..8`) need every attention layer on the fused posptr Split-KV path:
+        `int4`/`int8` KV, power-of-two head_dim, no softcap, no sliding-window ring (ring writes would
+        bake python `start_pos` into the capture). Recurrent (GatedDeltaNet) layers are graph-safe.
+        """
+        if self.is_tensor_parallel or self.tp_devices:
+            return False, "tensor-parallel"
+        if getattr(self.config, "is_moe", False):
+            return False, "moe"
+        if not self.enable_cuda_graph:
+            return False, "cuda-graph-disabled"
+        if self.first_device.type != "cuda":
+            return False, "non-cuda"
+        if self.last_device != self.first_device and self.lm_head is None:
+            return False, "sharded-head"
+        if float(getattr(self.config, "attn_logit_softcapping", 0.0)) != 0.0:
+            return False, "attn-softcap"
+        hd = int(getattr(self.config, "head_dim", 0))
+        if hd not in (32, 64, 128, 256):
+            return False, "head-dim"
+        for idx, blk in enumerate(self.layers):
+            if getattr(blk, "is_recurrent", False):
+                continue
+            lkv = kv_manager.layers[idx]
+            if lkv is None:
+                return False, f"layer-{idx}-missing-kv"
+            if lkv.kv_dtype not in ("int4", "int8"):
+                return False, f"layer-{idx}-kv-dtype-{lkv.kv_dtype}"
+            if lkv.sliding_window is not None:
+                return False, f"layer-{idx}-sliding-window"
+        return True, "ok"
+
+    def _capture_verify_graphs(self, kv_manager: EngineKVCacheManager, s_len: int) -> None:
+        """
+        Capture per-GPU `torch.cuda.CUDAGraph`s for a whole `S=s_len` verify forward (all layers,
+        logits head included). Mirrors `_capture_decode_graphs` but for multi-row speculative
+        verification: positions flow through `pos_tensor` (`int32[1]` base position) everywhere,
+        recurrent layers record their zero-recompute rollback buffers into graph-owned memory.
+        """
+        ok, reason = self._verify_graph_eligibility(kv_manager)
+        if not ok:
+            raise RuntimeError(f"verify graphs not eligible: {reason}")
+        stages = self._compute_pp_stages()
+        # Snapshot live recurrent & KV state so warmup/capture leaves model state 100% untouched!
+        rec_snap = kv_manager.snapshot_recurrent_gpu() if kv_manager.has_recurrent else {}
+        saved_lens = [lkv.seq_len for lkv in kv_manager._iter_all_kv_caches()]
+
+        unique_devs = {dev for dev, _, _ in stages} | {self.first_device, self.last_device}
+        for dev in unique_devs:
+            self.rope.ensure_capacity(dev, self.config.max_context_len)
+            with cuda_device_scope(dev):
+                if dev not in self._verify_pos_bufs:
+                    self._verify_pos_bufs[dev] = torch.zeros((1,), device=dev, dtype=torch.int32)
+
+        for idx, blk in enumerate(self.layers):
+            if blk.is_recurrent:
+                st = kv_manager.recurrent_states[idx]
+                assert st is not None
+                dn: GGUFGatedDeltaNet = blk.attn  # type: ignore[assignment]
+                st.ensure_allocated(dn.conv_dim, dn.conv_kernel, dn.num_v_heads, dn.head_v_dim, dn.head_k_dim)
+            else:
+                lkv = kv_manager.layers[idx]
+                assert lkv is not None
+                n_h = blk.attn.n_heads  # type: ignore[attr-defined]
+                with cuda_device_scope(lkv.device):
+                    if lkv._graph_scratch_out is None:
+                        hd = lkv.head_dim
+                        lkv._graph_scratch_out = torch.empty((n_h * 8, 32, hd), device=lkv.device, dtype=torch.float32)
+                        lkv._graph_scratch_lse = torch.empty((n_h * 8, 32), device=lkv.device, dtype=torch.float32)
+
+        # Arm recurrent layers so the capture records the SAVE path (rollback buffers land in the
+        # graph-private pool and stay valid across every replay).
+        for _key, st in kv_manager._iter_all_recurrent_states():
+            st.verify_active = True
+            st._verify_cache = None
+
+        hidden = self.config.hidden_size
+        with cuda_device_scope(self.first_device):
+            if s_len not in self._verify_token_bufs:
+                self._verify_token_bufs[s_len] = torch.zeros((1, s_len), device=self.first_device, dtype=torch.long)
+
+        stage_graphs: List[Any] = []
+        stage_ins: List[torch.Tensor] = []
+        stage_outs: List[torch.Tensor] = []
+        for stage_idx, (dev, l0, l1) in enumerate(stages):
+            pos_buf = self._verify_pos_bufs[dev]
+            with cuda_device_scope(dev):
+                in_buf = torch.zeros((1, s_len, hidden), device=dev, dtype=torch.float32)
+
+                def _run_stage(
+                    _s_idx: int = stage_idx,
+                    _l0: int = l0,
+                    _l1: int = l1,
+                    _in_b: torch.Tensor = in_buf,
+                    _pos_b: torch.Tensor = pos_buf,
+                    _sl: int = s_len,
+                ) -> torch.Tensor:
+                    if _s_idx == 0:
+                        assert self._verify_token_bufs[_sl] is not None
+                        h_cur = self.token_embd.embed_lookup(self._verify_token_bufs[_sl], dtype=torch.float32)
+                        if self.config.embed_scale != 1.0:
+                            h_cur = h_cur * self.config.embed_scale
+                    else:
+                        h_cur = _in_b
+                    for b_i in range(_l0, _l1):
+                        h_cur = self.layers[b_i](
+                            h_cur,
+                            kv_manager.layers[b_i],
+                            0,
+                            kv_manager.recurrent_states[b_i],
+                            self.compute_dtype,
+                            pos_tensor=_pos_b,
+                        )
+                    return h_cur
+
+                # Warmup on side stream before capture
+                s_warm = torch.cuda.Stream(device=dev)
+                s_warm.wait_stream(torch.cuda.current_stream(dev))
+                with torch.cuda.stream(s_warm):
+                    _ = _run_stage()
+                torch.cuda.current_stream(dev).wait_stream(s_warm)
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=s_warm):
+                    out_buf = _run_stage()
+
+                stage_graphs.append(g)
+                stage_ins.append(in_buf)
+                stage_outs.append(out_buf)
+
+        head_dev = self.last_device if self.lm_head is not None else self.first_device
+        with cuda_device_scope(head_dev):
+            head_in = torch.zeros((1, s_len, hidden), device=head_dev, dtype=torch.float32)
+
+            def _run_head(_hin: torch.Tensor = head_in) -> Tuple[torch.Tensor, torch.Tensor]:
+                if self.last_device == head_dev:
+                    normed = self.output_norm(_hin, out_dtype=self.compute_dtype)
+                else:
+                    normed = _hin.to(self.compute_dtype)
+                proj = self.lm_head(normed) if self.lm_head is not None else self.token_embd(normed)
+                lf = proj.float()
+                if self.config.final_logit_softcapping > 0.0:
+                    cap = self.config.final_logit_softcapping
+                    lf = torch.tanh(lf / cap) * cap
+                return lf, normed
+
+            sh_warm = torch.cuda.Stream(device=head_dev)
+            sh_warm.wait_stream(torch.cuda.current_stream(head_dev))
+            with torch.cuda.stream(sh_warm):
+                _ = _run_head()
+            torch.cuda.current_stream(head_dev).wait_stream(sh_warm)
+
+            gh = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gh, stream=sh_warm):
+                logits_buf, normed_buf = _run_head()
+
+        # Persist the graph-owned rollback buffers for replay-time zero-recompute commits.
+        for _key, st in kv_manager._iter_all_recurrent_states():
+            st._graph_verify_cache = st._verify_cache
+            st._verify_cache = None
+            st.verify_active = False
+
+        # Restore live KV lengths & recurrent states untouched
+        for lkv, slen in zip(kv_manager._iter_all_kv_caches(), saved_lens):
+            lkv.rewind_to(slen)
+        if kv_manager.has_recurrent:
+            kv_manager.restore_recurrent_gpu(rec_snap, kv_manager.recurrent_seq_len)
+
+        self._verify_stage_data[s_len] = (stages, stage_graphs, stage_ins, stage_outs)
+        self._verify_head_data[s_len] = (gh, head_in, logits_buf, normed_buf)
+        self._verify_graph_caps[s_len] = tuple(lkv.capacity for lkv in kv_manager._iter_all_kv_caches())
+        self._verify_graphs_ready[s_len] = True
+
+    @torch.inference_mode()
+    def forward_verify_step(
+        self,
+        verify_ids: Any,
+        kv_manager: EngineKVCacheManager,
+        start_pos: int,
+        return_normed_hidden: bool = False,
+    ) -> Any:
+        """
+        Multi-row (`S=2..8`) speculative verification forward. Returns `[1, S, vocab]` logits (every
+        position, for acceptance checking + the bonus token), plus all rows' post-`output_norm` hidden
+        states when `return_normed_hidden=True`.
+
+        Replays per-stage `torch.cuda.CUDAGraph`s when the model is eligible (all attention layers on
+        the fused posptr Split-KV path, recurrent layers armed); falls back to the eager `forward()`
+        otherwise, so behavior is never silently degraded — just faster or identical to today.
+        """
+        if isinstance(verify_ids, torch.Tensor):
+            verify_list = [int(t) for t in verify_ids.view(-1).tolist()]
+        else:
+            verify_list = [int(t) for t in verify_ids]
+        s_len = len(verify_list)
+        step_inp = torch.tensor([verify_list], dtype=torch.long, device=self.first_device)
+
+        def _eager() -> Any:
+            return self.forward(
+                step_inp,
+                kv_manager,
+                start_pos=start_pos,
+                logits_to_keep=s_len,
+                return_normed_hidden=return_normed_hidden,
+            )
+
+        if (
+            self._verify_graphs_failed
+            or s_len < 2
+            or s_len > 8
+            or not self._verify_graph_eligibility(kv_manager)[0]
+        ):
+            return _eager()
+
+        # Ensure KV cache pages won't reallocate mid-step; re-capture only when page capacity grows
+        kv_manager.ensure_all_kv_capacity(start_pos + s_len)
+        cur_caps = tuple(lkv.capacity for lkv in kv_manager._iter_all_kv_caches())
+        if not self._verify_graphs_ready.get(s_len, False) or self._verify_graph_caps.get(s_len) != cur_caps:
+            try:
+                self._capture_verify_graphs(kv_manager, s_len)
+            except Exception:
+                self._verify_graphs_failed = True
+                return _eager()
+
+        stages, graphs, ins, outs = self._verify_stage_data[s_len]
+        gh, head_in, logits_buf, normed_buf = self._verify_head_data[s_len]
+
+        with cuda_device_scope(self.first_device):
+            self._verify_token_bufs[s_len].copy_(step_inp)
+        for dev, pbuf in self._verify_pos_bufs.items():
+            with cuda_device_scope(dev):
+                pbuf.fill_(start_pos)
+
+        for s_idx, (dev, _, _) in enumerate(stages):
+            if s_idx > 0:
+                ins[s_idx].copy_(outs[s_idx - 1])
+            with cuda_device_scope(dev):
+                graphs[s_idx].replay()
+
+        for lkv in kv_manager._iter_all_kv_caches():
+            lkv.rewind_to(start_pos + s_len)
+
+        head_in.copy_(outs[-1])
+        with cuda_device_scope(head_in.device):
+            gh.replay()
+        if return_normed_hidden:
+            return logits_buf, normed_buf
+        return logits_buf
 
     def _norm_trunk_hidden(self, raw_h: torch.Tensor) -> torch.Tensor:
         target_dev = self.first_device if self.is_tensor_parallel else self.last_device
