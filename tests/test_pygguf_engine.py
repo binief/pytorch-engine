@@ -852,7 +852,7 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
                 "pos_ptr": "*i32",
                 "capacity": "i32",
             },
-            {"HEAD_DIM": 256, "BLOCK_D": 256},
+            {"HEAD_DIM": 256, "BLOCK_D": 256, "S_NEW": 1},
             False,
         ),
         (
@@ -871,7 +871,7 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
                 "capacity": "i32",
                 "sm_scale": "fp32",
             },
-            {"GQA_GROUP": 6, "NUM_SPLITS": 32, "BLOCK_S": 32, "HEAD_DIM": 256},
+            {"GQA_GROUP": 6, "NUM_SPLITS": 32, "BLOCK_S": 32, "HEAD_DIM": 256, "Q_LEN": 1},
             False,
         ),
         (
@@ -959,7 +959,7 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
                 "pos_ptr": "*i32",
                 "capacity": "i32",
             },
-            {"HALF_D": 128, "BLOCK_HD": 128},
+            {"HALF_D": 128, "BLOCK_HD": 128, "S_NEW": 1},
             False,
         ),
         (
@@ -998,7 +998,7 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
                 "capacity": "i32",
                 "sm_scale": "fp32",
             },
-            {"GQA_GROUP": 6, "NUM_SPLITS": 32, "BLOCK_S": 32, "HALF_D": 128},
+            {"GQA_GROUP": 6, "NUM_SPLITS": 32, "BLOCK_S": 32, "HALF_D": 128, "Q_LEN": 1},
             False,
         ),
         (
@@ -1054,6 +1054,14 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
                     cfg = dict(constants, Q_LEN=q_len, WIN_RING=ring,
                                WINDOW_SIZE=9 if ring else 0)
                     specs.append((f"{name}_Q{q_len}_R{int(ring)}", fn, tgt, sig, cfg, check))
+        if name in ("FLASH_DECODE_POSPTR", "INT4_FLASH_DECODE_POSPTR"):
+            for q_len in (2, 3, 8):
+                cfg = dict(constants, Q_LEN=q_len)
+                specs.append((f"{name}_Q{q_len}", fn, tgt, sig, cfg, check))
+        if name in ("KV_APPEND_POSPTR", "KV_APPEND_INT4_POSPTR"):
+            for s_new in (2, 4):
+                cfg = dict(constants, S_NEW=s_new)
+                specs.append((f"{name}_S{s_new}", fn, tgt, sig, cfg, check))
     for name, fn, tgt, sig, constexprs, assert_zero_b8 in specs:
         # Triton 3.x prototype argument order follows `signature` insertion order; normalize the
         # spec dict to the kernel's actual parameter order and sanity-check coverage.
@@ -1062,7 +1070,12 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
         allowed = {p.name for p in fn.params if not p.is_constexpr}
         assert required <= set(sig) <= allowed, f"{name}: signature/parameter mismatch: {set(sig) ^ required}"
         sig = {a: sig[a] for a in fn.arg_names if a in sig}
-        compiled = triton_compile(ASTSource(fn=fn, signature=sig, constants=constexprs), target=tgt)
+        _ast_kwargs = {"fn": fn, "signature": sig}
+        if "constexprs" in _inspect.signature(ASTSource.__init__).parameters:
+            _ast_kwargs["constexprs"] = constexprs
+        else:  # Triton < 3.9
+            _ast_kwargs["constants"] = constexprs
+        compiled = triton_compile(ASTSource(**_ast_kwargs), target=tgt)
         ptx = compiled.asm["ptx"]
         assert len(ptx) > 1000
         if assert_zero_b8:
@@ -2138,6 +2151,18 @@ if __name__ == "__main__":
     test_agentic_reasoning_and_tool_calls()
     test_tp2_exactness_and_all_temp_speculative()
     test_draft_mtp_and_zero_recompute_rollback()
+    from tests.test_verify_cuda_graph import (
+        test_begin_recurrent_verify_graph_cache_wiring,
+        test_forward_verify_step_cpu_fallback_matches_eager,
+        test_kv_append_pos_tensor_multirow_cpu,
+        test_rope_pos_tensor_multirow_positions,
+        test_verify_triton_kernels_multirow,
+    )
+    test_rope_pos_tensor_multirow_positions()
+    test_kv_append_pos_tensor_multirow_cpu()
+    test_begin_recurrent_verify_graph_cache_wiring()
+    test_forward_verify_step_cpu_fallback_matches_eager()
+    test_verify_triton_kernels_multirow()
     test_int4_kv_ring_mtp_and_adaptive_depth()
     test_qwen35_hybrid_deltanet_and_ud_quants()
     test_dense_moe_and_openai_server()

@@ -766,17 +766,18 @@ class PyGGUFEngine:
                 v_len = len(verify_seq)
                 if self.kv_manager.has_recurrent:
                     self.kv_manager.begin_recurrent_verify()
-                step_inp = torch.tensor([verify_seq], dtype=torch.long)
+                # Replays a captured whole-step CUDA graph on eligible models (int4/int8 KV, non-MoE,
+                # single-node PP/1-GPU); falls back to the eager forward otherwise.
+                step_logits_h = self.model.forward_verify_step(
+                    verify_seq,
+                    self.kv_manager,
+                    start_pos=kv_pos,
+                    return_normed_hidden=eff_use_mtp,
+                )
                 if eff_use_mtp:
-                    step_logits, step_h_norm = self.model(
-                        step_inp,
-                        self.kv_manager,
-                        start_pos=kv_pos,
-                        logits_to_keep=v_len,
-                        return_normed_hidden=True,
-                    )
+                    step_logits, step_h_norm = step_logits_h
                 else:
-                    step_logits = self.model(step_inp, self.kv_manager, start_pos=kv_pos, logits_to_keep=v_len)
+                    step_logits = step_logits_h
                     step_h_norm = None
 
                 cand_tokens = []

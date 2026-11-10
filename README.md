@@ -54,6 +54,22 @@ Equivalent CLI flags on `kaggle_serve.py`: `--rope-scaling-type yarn --rope-scal
 - **Zero-cost N-gram self-speculative decoding** + optional GGUF `draft-mtp` head with adaptive depth.
 - **Prefix KV cache reuse** across multi-turn requests and a GPU-resident top-k/top-p/min-p/repetition-penalty sampler (single sync per token).
 
+## CUDA-graph verify path (S=2..8)
+
+Whole-step CUDA graphs for the speculative verify forward are captured automatically on eligible
+single-node runs (1-GPU or PP, non-MoE, non-TP): every attention layer must be on the fused
+posptr Split-KV INT4/INT8 path (`head_dim` in 32/64/128/256, `attn_logit_softcapping == 0`, no
+sliding-window ring layers) — this forces int4/int8 KV. Recurrent GatedDeltaNet layers are captured
+as well and keep their zero-recompute rollback semantics (`begin_recurrent_verify()` re-points at
+graph-owned scan-input buffers on every replay). Any ineligibility or capture failure falls back to
+the eager verify forward with identical semantics; set `enable_cuda_graph=False` to disable both the
+S=1 decode graphs and the S≥2 verify graphs. Eligibility is checked per model; the KV-page capacity
+check re-captures automatically when the KV cache grows.
+
+This must be re-benchmarked on dual T4 (Kaggle) — no new T4 numbers are claimed yet. If you run the
+"5b. MTP depth sweep" notebooks on this branch, report both before/after `predicted_per_second` for
+`mtp only` (pp) and the adaptive rows; compare against the table above.
+
 ## Dual-T4 tok/s notes
 
 Measured on dual-T4 with `unsloth/Qwen3.8-27B-UD-Q4_K_M` (hybrid 48× GatedDeltaNet + 16× FullAttention),
