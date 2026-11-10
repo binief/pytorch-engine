@@ -57,22 +57,32 @@ Equivalent CLI flags on `kaggle_serve.py`: `--rope-scaling-type yarn --rope-scal
 ## Dual-T4 tok/s notes
 
 Measured on dual-T4 with `unsloth/Qwen3.8-27B-UD-Q4_K_M` (hybrid 48× GatedDeltaNet + 16× FullAttention),
-`max_context_len=65536`, `kv_dtype="int8"`, thinking on, short notebook test prompt:
+`max_context_len=65536`, `kv_dtype="int8"`, `parallel_mode="pp"`, thinking on, short prompt, `seed=42`,
+128 new tokens, full `timings` from `/v1/chat/completions`:
 
-- `parallel_mode="auto"` (→ TP=2) + `speculative_mtp=True` (`mtp_draft_tokens=2`) → **4.9 e2e tok/s** (llama.cpp: 20 tok/s).
-  Eager hybrid decode is Python-dispatch-bound: TP bypasses the per-stage CUDA-graph capture, and the M=3 verify
-  pass bypasses it too, so every token pays thousands of Python kernel launches + cross-GPU activation copies.
-- Fastest known PyGGUF recipe for this workload: `parallel_mode="pp"` (per-stage CUDA graphs for M=1) with speculation
-  off (`speculative_mtp=False` and `speculative_ngram=False`) — every step replays a captured graph with zero
-  all-reduce and no Python dispatch. Trade-off: prefill is kernel-bound ~2x slower than TP on PP.
-- With `speculative_mtp=True`, both verify passes (`S >= 2`) run eagerly; on dispatch-bound hardware the draft
-  overhead can outweigh its gains. Watch `timings.predicted_per_second` and `timings.mtp_accepted/mtp_drafted`
-  (exposed both in sync responses and in the streaming `include_usage` final chunk under `timings`).
+| case | e2e tok/s | predicted tok/s | mtp accepted/drafted |
+|---|---|---|---|
+| Engine default (temp 0.6, MTP k=2 + n-gram) | 8.22 | 8.69 | 79/104 (76.0%) |
+| Spec OFF (temp 0.6) | 5.33 | 5.46 | — |
+| n-gram only (temp 0.6) | 5.49 | 5.63 | — (n-gram 7/26) |
+| **MTP only (temp 0.6)** | **8.76** | **9.14** | **83/110 (75.5%)** |
+| Greedy + spec OFF | 5.72 | 5.87 | — |
+| Greedy + engine default | 7.64 | 7.92 | 75/117 (64.1%) |
+| Spec OFF + thinking off | 5.57 | 5.80 | — |
 
-A/B from a notebook cell:
-`client.chat.completions.create(..., stream=False, extra_body={"speculative_mtp": False, "speculative_ngram": False})`
-and compare `resp["timings"]["predicted_per_second"]` against the speculative run. TP remains the right choice for
-prefill-heavy / large-batch prompts; it is not dispatch-bound there.
+llama.cpp reference on the same model/ctx/KV (TP split): **~20 tok/s** — the residual gap is kernel
+throughput on Turing (Q4_K GEMV etc.), not scheduling. Key lessons from the measurement:
+
+- **Speculation ON wins decisively** — ~2.3–2.5 tokens per verify step at 75–77% acceptance. Do not disable MTP on this workload.
+- Spec-off M=1 PP graph replay is *slower*, not faster: per-token cost on T4 is kernel-bound (~173–183 ms), and graphs only remove dispatch, not weight reads.
+- n-gram is acceptance-neutral at temperature 0.6 (7/26) but zero-VRAM; keep for repetitive/greedy contexts.
+- `enable_thinking=False` cuts wall-clock by halving generated tokens, not by raising tok/s (5.8 pred tok/s).
+- Prefill is fast (~0.55s for this prompt; chunked 2048, cache-aware `cache_prompt` reuses prefixes across turns).
+
+Next levers to try (all per-request, no relaunch — see "5b. MTP depth sweep" in the notebooks):
+`mtp_draft_tokens=3`, and adaptive chaining (`mtp_adaptive=True` with `mtp_confidence_threshold` 0.55/0.30).
+A TP-vs-PP A/B with speculation on requires relaunching with `parallel_mode="tp"` and re-running the sweep —
+verify steps are weight-read-bound, so TP should win by the combined-bandwidth delta.
 
 ## Tests
 
