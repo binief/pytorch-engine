@@ -579,6 +579,7 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
         _gated_deltanet_decode_step_kernel,
         _gated_deltanet_multirow_verify_kernel,
         _gated_deltanet_scan_kernel,
+        _gqa_flash_attn_kernel,
         _int4_gqa_flash_decode_posptr_kernel,
         _int4_gqa_flash_decode_split_kernel,
         _int8_gqa_flash_decode_posptr_kernel,
@@ -999,6 +1000,66 @@ def test_triton_sm75_ptx_and_interpreter_exactness() -> None:
                 "sm_scale": "fp32",
             },
             {"GQA_GROUP": 6, "NUM_SPLITS": 32, "BLOCK_S": 32, "HALF_D": 128, "Q_LEN": 1},
+            False,
+        ),
+        (
+            "GQA_FLASH_ATTN_F16",
+            _gqa_flash_attn_kernel,
+            target,
+            {
+                "q_ptr": "*fp16",
+                "k_ptr": "*fp16",
+                "ks_ptr": "*fp16",
+                "v_ptr": "*fp16",
+                "vs_ptr": "*fp16",
+                "out_ptr": "*fp16",
+                "start_pos": "i32",
+                "total_len": "i32",
+                "capacity": "i32",
+                "sm_scale": "fp32",
+                "q_len": "i32",
+            },
+            {"KV_DTYPE": 0, "SOFTCAP": 0.0, "GQA_GROUP": 2, "BLOCK_M": 16, "BLOCK_N": 64, "HEAD_DIM": 128},
+            False,
+        ),
+        (
+            "GQA_FLASH_ATTN_I8",
+            _gqa_flash_attn_kernel,
+            target,
+            {
+                "q_ptr": "*fp16",
+                "k_ptr": "*i8",
+                "ks_ptr": "*fp16",
+                "v_ptr": "*i8",
+                "vs_ptr": "*fp16",
+                "out_ptr": "*fp16",
+                "start_pos": "i32",
+                "total_len": "i32",
+                "capacity": "i32",
+                "sm_scale": "fp32",
+                "q_len": "i32",
+            },
+            {"KV_DTYPE": 1, "SOFTCAP": 4.0, "GQA_GROUP": 2, "BLOCK_M": 16, "BLOCK_N": 64, "HEAD_DIM": 128},
+            False,
+        ),
+        (
+            "GQA_FLASH_ATTN_I4",
+            _gqa_flash_attn_kernel,
+            target,
+            {
+                "q_ptr": "*fp16",
+                "k_ptr": "*u8",
+                "ks_ptr": "*fp16",
+                "v_ptr": "*u8",
+                "vs_ptr": "*fp16",
+                "out_ptr": "*fp16",
+                "start_pos": "i32",
+                "total_len": "i32",
+                "capacity": "i32",
+                "sm_scale": "fp32",
+                "q_len": "i32",
+            },
+            {"KV_DTYPE": 2, "SOFTCAP": 0.0, "GQA_GROUP": 6, "BLOCK_M": 16, "BLOCK_N": 64, "HEAD_DIM": 128},
             False,
         ),
         (
@@ -2163,6 +2224,9 @@ if __name__ == "__main__":
     test_begin_recurrent_verify_graph_cache_wiring()
     test_forward_verify_step_cpu_fallback_matches_eager()
     test_verify_triton_kernels_multirow()
+    from tests.test_flash_attention import test_attend_cpu_fallback_contract, test_gqa_flash_attn_interpreter_parity
+    test_attend_cpu_fallback_contract()
+    test_gqa_flash_attn_interpreter_parity()
     test_int4_kv_ring_mtp_and_adaptive_depth()
     test_qwen35_hybrid_deltanet_and_ud_quants()
     test_dense_moe_and_openai_server()
