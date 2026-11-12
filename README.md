@@ -49,10 +49,13 @@ Equivalent CLI flags on `kaggle_serve.py`: `--rope-scaling-type yarn --rope-scal
 
 - **CUDA Graph replay** for `M=1` decode (per-pipeline-stage capture, re-captured only when KV pages grow).
 - **Triton split-KV flash-decode** straight over the INT4/INT8 KV for `q_len <= 8` (single-token decode and short speculative verify), plus multi-row weight-reusing GEMV (`M <= 8`).
+- **Fused single-pass Triton GQA flash attention** for big contexts and softcap (Path 3a): `tl.dot` tensor-core MMAs, FP32 online softmax, reads INT4/INT8/FP16 KV in-SRAM (no dequant materialization). CPU-verified numerics; T4 win must be measured (see below). Falls back to the torch online-softmax path on non-CUDA / non-power-of-two head_dim / ring layouts.
 - **GQA-native SDPA** for short/medium contexts (`enable_gqa=True`, K/V never materialized expanded; falls back to `repeat_interleave` on older torch).
 - **GQA-folded chunked online-softmax** for big contexts/softcapping (see above).
 - **Zero-cost N-gram self-speculative decoding** + optional GGUF `draft-mtp` head with adaptive depth.
 - **Prefix KV cache reuse** across multi-turn requests and a GPU-resident top-k/top-p/min-p/repetition-penalty sampler (single sync per token).
+
+On-GPU benchmark checklist for this addition (dual T4, Kaggle): prefill tok/s at 32K/64K context for the same prompt before/after (expect the win at long prefill, not at short-context decode, which uses Path 1); verify tok/s unchanged (Path 1 untouched); watch for softcap (Gemma) parity. No T4 speedup is claimed until measured.
 
 ## CUDA-graph verify path (S=2..8)
 

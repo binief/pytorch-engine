@@ -686,6 +686,154 @@ if HAS_TRITON:
         tl.store(part_lse_ptr + lse_offset, m_i + tl.log(tl.maximum(l_i, 1e-20)))
 
     @triton.jit
+    def _gqa_flash_attn_kernel(
+        q_ptr,      # fp16 [n_heads, q_len, head_dim]  (contiguous)
+        k_ptr,      # KV_DTYPE == 0: fp16 [n_kv, capacity, head_dim]
+                    # KV_DTYPE == 1: int8 [n_kv, capacity, head_dim]
+                    # KV_DTYPE == 2: uint8 [n_kv, capacity, head_dim // 2]  (half-split nibble packing)
+        ks_ptr,     # fp16 [n_kv, capacity]            (KV_DTYPE == 1)
+                    # fp16 [n_kv, capacity, 2]         (KV_DTYPE == 2)
+        v_ptr,
+        vs_ptr,
+        out_ptr,    # element_ty in {fp16, fp32} [n_heads, q_len, head_dim] (contiguous)
+        start_pos,  # i32 chunk base position (query row i sits at start_pos + i)
+        total_len,  # i32 valid KV entries
+        capacity,   # i32 buffer capacity (row stride)
+        sm_scale,   # fp32
+        q_len,      # i32
+        KV_DTYPE: tl.constexpr,   # 0 = fp16, 1 = int8, 2 = int4
+        SOFTCAP: tl.constexpr,    # 0.0 = disabled, else attention-logit softcap (Gemma)
+        GQA_GROUP: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+    ):
+        """
+        Fused single-pass online-softmax GQA flash attention for long contexts (prefill + big-context
+        decode/verify on the eager path). Reads INT4/INT8 KV directly (no dequant materialization),
+        fp16 tensor-core MMAs via `tl.dot`, FP32 accumulators. Row `i` attends keys `[0, start_pos + i]`.
+        Non-ring layouts only (`win_start == 0`); ring layers stay on the torch fallback in `attend()`.
+        """
+        pid_m = tl.program_id(0)
+        head = tl.program_id(1)
+        kv_head = head // GQA_GROUP
+
+        HALF_D: tl.constexpr = HEAD_DIM // 2
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < q_len
+        offs_d = tl.arange(0, HEAD_DIM)
+        offs_hd = tl.arange(0, HALF_D)
+
+        cap64 = capacity.to(tl.int64)
+        kv_h64 = kv_head.to(tl.int64)
+        if KV_DTYPE == 2:
+            k_base = k_ptr + kv_h64 * cap64 * HALF_D
+            v_base = v_ptr + kv_h64 * cap64 * HALF_D
+            ks_base = ks_ptr + kv_h64 * cap64 * 2
+            vs_base = vs_ptr + kv_h64 * cap64 * 2
+        else:
+            k_base = k_ptr + kv_h64 * cap64 * HEAD_DIM
+            v_base = v_ptr + kv_h64 * cap64 * HEAD_DIM
+            ks_base = ks_ptr + kv_h64 * cap64
+            vs_base = vs_ptr + kv_h64 * cap64
+
+        # Load q rows (fp16); split halves only on the int4 path.
+        q_row_base = head.to(tl.int64) * q_len.to(tl.int64) * HEAD_DIM
+        q_offs = q_row_base + offs_m[:, None].to(tl.int64) * HEAD_DIM + offs_d[None, :]
+        q_h = tl.load(q_ptr + q_offs, mask=mask_m[:, None], other=0.0)
+        if KV_DTYPE == 2:
+            q_lo = tl.load(q_ptr + q_row_base + offs_m[:, None].to(tl.int64) * HEAD_DIM + offs_hd[None, :],
+                           mask=mask_m[:, None], other=0.0)
+            q_hi = tl.load(q_ptr + q_row_base + offs_m[:, None].to(tl.int64) * HEAD_DIM + HALF_D + offs_hd[None, :],
+                           mask=mask_m[:, None], other=0.0)
+
+        q_abs = start_pos + offs_m  # absolute position per query row
+
+        # Highest KV index this block may read: row (pid_m*BLOCK_M + BLOCK_M - 1) sees abs+1 keys.
+        max_visible = tl.minimum(total_len, start_pos + pid_m * BLOCK_M + BLOCK_M)
+
+        neg_inf = tl.zeros((), dtype=tl.float32) - float("inf")
+        m_i = tl.zeros((BLOCK_M,), dtype=tl.float32) + neg_inf
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        if KV_DTYPE == 2:
+            acc_lo = tl.zeros((BLOCK_M, HALF_D), dtype=tl.float32)
+            acc_hi = tl.zeros((BLOCK_M, HALF_D), dtype=tl.float32)
+        else:
+            acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+
+        for kv_start in range(0, max_visible, BLOCK_N):
+            offs_n = kv_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < max_visible
+            offs_n64 = offs_n.to(tl.int64)
+            mask_nk = mask_n[:, None]
+
+            if KV_DTYPE == 2:
+                kp = tl.load(k_base + offs_n64[:, None] * HALF_D + offs_hd[None, :], mask=mask_nk, other=0x88)
+                ks_lo = tl.load(ks_base + offs_n64 * 2, mask=mask_n, other=0.0).to(tl.float32)
+                ks_hi = tl.load(ks_base + offs_n64 * 2 + 1, mask=mask_n, other=0.0).to(tl.float32)
+                k_lo = ((kp & 0x0F).to(tl.float32) - 8.0).to(tl.float16)
+                k_hi = (((kp >> 4) & 0x0F).to(tl.float32) - 8.0).to(tl.float16)
+                scores = (
+                    tl.dot(q_lo, tl.trans(k_lo), out_dtype=tl.float32) * ks_lo[None, :]
+                    + tl.dot(q_hi, tl.trans(k_hi), out_dtype=tl.float32) * ks_hi[None, :]
+                )
+            elif KV_DTYPE == 1:
+                kq = tl.load(k_base + offs_n64[:, None] * HEAD_DIM + offs_d[None, :], mask=mask_nk, other=0)
+                ks = tl.load(ks_base + offs_n64, mask=mask_n, other=0.0).to(tl.float32)
+                scores = tl.dot(q_h, tl.trans(kq.to(tl.float16)), out_dtype=tl.float32) * ks[None, :]
+            else:
+                k_blk = tl.load(k_base + offs_n64[:, None] * HEAD_DIM + offs_d[None, :], mask=mask_nk, other=0.0)
+                scores = tl.dot(q_h, tl.trans(k_blk), out_dtype=tl.float32)
+
+            scores = scores * sm_scale
+            if SOFTCAP > 0.0:
+                cap = SOFTCAP
+                e = tl.exp(tl.minimum(2.0 * scores / cap, 30.0))
+                tanh_s = (e - 1.0) / (e + 1.0)
+                scores = tanh_s * cap
+            # Causal + validity mask (rows are absolute positions: key visible iff key <= row_pos).
+            causal = offs_n[None, :] <= q_abs[:, None]
+            scores = tl.where(causal & mask_n[None, :], scores, float("-inf"))
+
+            m_ij = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            m_new_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            m_i_safe = tl.where(m_i == float("-inf"), 0.0, m_i)
+            alpha = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i_safe - m_new_safe))
+            p = tl.exp(scores - m_new_safe[:, None])
+
+            if KV_DTYPE == 2:
+                vp = tl.load(v_base + offs_n64[:, None] * HALF_D + offs_hd[None, :], mask=mask_nk, other=0x88)
+                vs_lo = tl.load(vs_base + offs_n64 * 2, mask=mask_n, other=0.0).to(tl.float32)
+                vs_hi = tl.load(vs_base + offs_n64 * 2 + 1, mask=mask_n, other=0.0).to(tl.float32)
+                v_lo = ((vp & 0x0F).to(tl.float32) - 8.0).to(tl.float16)
+                v_hi = (((vp >> 4) & 0x0F).to(tl.float32) - 8.0).to(tl.float16)
+                acc_lo = acc_lo * alpha[:, None] + tl.dot((p * vs_lo[None, :]).to(tl.float16), v_lo, out_dtype=tl.float32)
+                acc_hi = acc_hi * alpha[:, None] + tl.dot((p * vs_hi[None, :]).to(tl.float16), v_hi, out_dtype=tl.float32)
+            elif KV_DTYPE == 1:
+                vq = tl.load(v_base + offs_n64[:, None] * HEAD_DIM + offs_d[None, :], mask=mask_nk, other=0)
+                vs = tl.load(vs_base + offs_n64, mask=mask_n, other=0.0).to(tl.float32)
+                acc = acc * alpha[:, None] + tl.dot((p * vs[None, :]).to(tl.float16), vq.to(tl.float16), out_dtype=tl.float32)
+            else:
+                v_blk = tl.load(v_base + offs_n64[:, None] * HEAD_DIM + offs_d[None, :], mask=mask_nk, other=0.0)
+                acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v_blk, out_dtype=tl.float32)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
+
+        inv_l = 1.0 / tl.maximum(l_i, 1e-20)
+        out_row = head.to(tl.int64) * q_len.to(tl.int64) * HEAD_DIM + offs_m.to(tl.int64)[:, None] * HEAD_DIM
+        if KV_DTYPE == 2:
+            tl.store(out_ptr + out_row + offs_hd[None, :], (acc_lo * inv_l[:, None]).to(out_ptr.dtype.element_ty),
+                     mask=mask_m[:, None])
+            tl.store(out_ptr + out_row + HALF_D + offs_hd[None, :], (acc_hi * inv_l[:, None]).to(out_ptr.dtype.element_ty),
+                     mask=mask_m[:, None])
+        else:
+            tl.store(out_ptr + out_row + offs_d[None, :], (acc * inv_l[:, None]).to(out_ptr.dtype.element_ty),
+                     mask=mask_m[:, None])
+
+
+    @triton.jit
     def _gated_deltanet_scan_kernel(
         q_ptr,      # float32 [S, H_K, D_k] (pre-scaled by 1 / sqrt(D_k); tiled via pid_h % H_K!)
         k_ptr,      # float32 [S, H_K, D_k]
@@ -2003,7 +2151,51 @@ class LayerKVCache:
                 attn_mask = k_pos <= q_pos  # [q_len, total_len] bool mask (True = keep)
             return _sdpa(q, k_full, v_full, attn_mask=attn_mask, scale=sm_scale)
 
-        # Path 3: Online-Softmax Chunked Attention for Big Contexts (32K-256K+) or Gemma Softcapping.
+        # Path 3a: Fused Triton GQA flash attention (single pass, tensor-core `tl.dot`, reads quantized
+        # KV in-SRAM — no dequant materialization). Used for big contexts and softcap when possible.
+        if HAS_TRITON and q.is_cuda and not is_ring and head_dim in (32, 64, 128, 256):
+            dev = self.k_buf.device
+            with cuda_device_scope(dev):
+                assert self.k_buf is not None and self.v_buf is not None
+                kv_kind = {"fp16": 0, "int8": 1, "int4": 2}[self.kv_dtype]
+                q_c = q.to(device=dev)
+                if q_c.dtype != torch.float16:
+                    q_c = q_c.to(torch.float16)
+                q2 = q_c.squeeze(0).contiguous()  # [n_heads, q_len, head_dim]
+                out_c = torch.empty((n_heads, q_len, head_dim), device=dev, dtype=torch.float16)
+                if self.kv_dtype == "int4":
+                    k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_scale, self.v_scale
+                elif self.kv_dtype == "int8":
+                    k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_scale, self.v_scale
+                else:  # fp16: scales unused (dummy pointers, never loaded)
+                    k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_buf, self.v_buf
+                block_m = 64 if q_len >= 64 else (32 if q_len >= 32 else 16)
+                softcap_val = float(softcap)
+                grid = (triton.cdiv(q_len, block_m), n_heads)
+                _gqa_flash_attn_kernel[grid](
+                    q2,
+                    k_src,
+                    ks_src,
+                    v_src,
+                    vs_src,
+                    out_c,
+                    start_pos,
+                    total_len,
+                    self.capacity,
+                    sm_scale,
+                    q_len,
+                    KV_DTYPE=kv_kind,
+                    SOFTCAP=softcap_val,
+                    GQA_GROUP=gqa_group,
+                    BLOCK_M=block_m,
+                    BLOCK_N=64,
+                    HEAD_DIM=head_dim,
+                    num_warps=4,
+                    num_stages=2,
+                )
+                return out_c.to(q.dtype).view(1, n_heads, q_len, head_dim)
+
+        # Path 3b: Online-Softmax Chunked Attention fallback (CPU / non-pow2 head_dim / ring+softcap).
         # GQA group is folded into the query-row dimension (`2*qc` rows per kv-head) so K/V chunks are
         # never expanded; tensor-core fp16/bf16 matmuls with FP32 online-softmax bookkeeping.
         n_kv = self.n_kv_heads
