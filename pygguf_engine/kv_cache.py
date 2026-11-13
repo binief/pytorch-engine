@@ -2309,6 +2309,18 @@ class LayerKVCache:
         return torch.cat(outputs, dim=2)
 
 
+def _clone_to_cpu(t: torch.Tensor) -> torch.Tensor:
+    """Copy a tensor into (pinned, when possible) CPU RAM for spill storage."""
+    if t.is_cuda and torch.cuda.is_available():
+        try:
+            out = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            out.copy_(t, non_blocking=False)
+            return out
+        except Exception:
+            pass
+    return t.detach().clone()
+
+
 class EngineKVCacheManager:
     """
     Coordinates per-layer KV caches (for full-attention layers) AND fixed-size recurrent states
@@ -2327,11 +2339,16 @@ class EngineKVCacheManager:
         recurrent_layers: Optional[Sequence[bool]] = None,
         tp_devices: Optional[Sequence[torch.device]] = None,
         flash_attn: bool = True,
+        kv_cpu_spill: bool = False,
     ) -> None:
         rec_flags = list(recurrent_layers) if recurrent_layers is not None else [False] * n_layers
         self.has_recurrent = any(rec_flags)
         self.tp_devices: List[torch.device] = list(tp_devices) if tp_devices and len(tp_devices) > 1 else []
         self._flash_attn: bool = bool(flash_attn)
+        # Park trunk attention KV + recurrent states in CPU RAM between turns (restored on prefix hit).
+        self.kv_cpu_spill: bool = bool(kv_cpu_spill)
+        self.has_spill: bool = False
+        self._spill: Optional[Dict[str, Any]] = None
         tp_world = len(self.tp_devices)
 
         if tp_world > 1:
@@ -2629,6 +2646,7 @@ class EngineKVCacheManager:
         self._ckpt_states.clear()
         self._mtp_ckpt_len = 0
         self._mtp_ckpt_h = None
+        self._drop_spill()
         self.rollback_to(0)
 
     def allocated_vram_bytes(self) -> int:
@@ -2659,3 +2677,132 @@ class EngineKVCacheManager:
         for _key, st in self._iter_all_recurrent_states():
             total += st.allocated_bytes()
         return total
+
+    # ------------------------------------------------------------------
+    # CPU-RAM KV spill (opt-in `kv_cpu_spill=True`): park trunk attention KV + recurrent
+    # states in host RAM at turn end; restore on the next prefix-cache hit. Ring (MTP)
+    # caches are small and stay on GPU; MTP rebase is handled by the engine's existing
+    # catch-up path. Restore granularity for recurrent layers is the full spill boundary
+    # or the mid-sequence prompt checkpoint (`_ckpt_len`) — same anchors as the live
+    # prefix-reuse path, so invariants (`recurrent_seq_len == len(cached_tokens)`) hold.
+    # ------------------------------------------------------------------
+    def _drop_spill(self) -> None:
+        self._spill = None
+        self.has_spill = False
+
+    def spill_kv_to_cpu(self) -> Optional[Dict[str, Any]]:
+        """Clone trunk attention KV (all layers/ranks) + recurrent states to CPU RAM and free
+        the GPU buffers. Atomic: if any clone fails nothing on the GPU is touched.
+        Returns a small stats dict, or None when there is nothing to spill."""
+        kv_layers = list(self._iter_all_kv_caches())
+        has_kv = any(lkv.k_buf is not None and lkv.seq_len > 0 for lkv in kv_layers)
+        rec_states = list(self._iter_all_recurrent_states()) if self.has_recurrent else []
+        has_rec = any(st is not None and st.ssm_state is not None for _key, st in rec_states)
+        if not has_kv and not has_rec:
+            self._drop_spill()
+            return None
+
+        # Phase 1: clone everything first; any exception leaves GPU state untouched.
+        spill_layers: List[Tuple[LayerKVCache, Dict[str, Any]]] = []
+        nbytes = 0
+        for lkv in kv_layers:
+            if lkv.sliding_window is not None:
+                continue  # bounded ring buffers stay on GPU
+            n = int(lkv.seq_len)
+            entry: Dict[str, Any] = {"len": n}
+            if lkv.k_buf is not None:
+                entry["k_buf"] = _clone_to_cpu(lkv.k_buf[:, :n, :])
+                entry["v_buf"] = _clone_to_cpu(lkv.v_buf[:, :n, :])
+                nbytes += (entry["k_buf"].numel() + entry["v_buf"].numel()) * entry["k_buf"].element_size()
+            if lkv.k_scale is not None:
+                entry["k_scale"] = _clone_to_cpu(lkv.k_scale[:, :n])
+                entry["v_scale"] = _clone_to_cpu(lkv.v_scale[:, :n])
+                nbytes += (entry["k_scale"].numel() + entry["v_scale"].numel()) * entry["k_scale"].element_size()
+            spill_layers.append((lkv, entry))
+        rec_snaps: List[Tuple[Tuple[int, int], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = []
+        for key, st in rec_states:
+            snap = st.clone_state(target_device=torch.device("cpu")) if st is not None else None
+            rec_snaps.append((key, snap))
+            if snap is not None:
+                nbytes += sum(t.numel() * t.element_size() for t in snap)
+
+        # Phase 2: free GPU buffers and publish the spill (cannot fail).
+        for lkv, entry in spill_layers:
+            lkv.k_buf = None
+            lkv.v_buf = None
+            lkv.k_scale = None
+            lkv.v_scale = None
+            lkv.capacity = 0
+            lkv._part_out_scratch = None
+            lkv._part_lse_scratch = None
+            lkv._graph_scratch_out = None
+            lkv._graph_scratch_lse = None
+            lkv.rewind_to(0)
+        for (_key, st) in rec_states:
+            if st is not None:
+                st.conv_state = None
+                st.ssm_state = None
+                st._verify_cache = None
+                st._graph_verify_cache = None
+        tokens = list(self.cached_tokens)
+        self._spill = {
+            "tokens": tokens,
+            "layers": spill_layers,
+            "recurrent": rec_snaps,
+            "bytes": nbytes,
+        }
+        self.has_spill = True
+        self.cached_tokens = []
+        self.recurrent_seq_len = 0
+        return {"bytes": nbytes, "len": len(tokens), "layers": len(spill_layers)}
+
+    def restore_kv_prefix(self, prompt_tokens: Sequence[int]) -> int:
+        """Restore a spilled prefix from CPU RAM when `prompt_tokens` shares a prefix with the
+        spilled session. Returns the number of tokens restored (0 when not applicable)."""
+        if not self.has_spill or self._spill is None:
+            return 0
+        spilled_tokens: List[int] = self._spill["tokens"]
+        limit = min(len(spilled_tokens), max(0, len(prompt_tokens) - 1))
+        matched = 0
+        while matched < limit and spilled_tokens[matched] == int(prompt_tokens[matched]):
+            matched += 1
+        if matched == 0:
+            return 0
+        full_boundary = len(spilled_tokens)
+        rec_snaps: List[Tuple[Tuple[int, int], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = self._spill["recurrent"]
+        if self.has_recurrent:
+            if matched == full_boundary and rec_snaps:
+                pass  # recurrent states restore from the full-boundary snapshot
+            elif self._ckpt_len > 0 and self._ckpt_states and matched >= self._ckpt_len:
+                matched = self._ckpt_len  # clamp to the mid-sequence prompt anchor
+            else:
+                return 0  # no usable recurrent anchor -> caller falls back to full re-prefill
+
+        with torch.inference_mode():
+            for lkv, entry in self._spill["layers"]:
+                src_len = int(entry["len"])
+                n = min(matched, src_len)
+                lkv._ensure_capacity(n)
+                if lkv.k_buf is not None and entry.get("k_buf") is not None:
+                    lkv.k_buf[:, :n, :].copy_(entry["k_buf"][:, :n, :].to(lkv.k_buf.device))
+                    lkv.v_buf[:, :n, :].copy_(entry["v_buf"][:, :n, :].to(lkv.k_buf.device))
+                if lkv.k_scale is not None and entry.get("k_scale") is not None:
+                    lkv.k_scale[:, :n, ...].copy_(entry["k_scale"][:, :n, ...].to(lkv.k_scale.device))
+                    lkv.v_scale[:, :n, ...].copy_(entry["v_scale"][:, :n, ...].to(lkv.k_scale.device))
+                lkv.seq_len = n
+                lkv.logical_seq_len = n
+            if self.has_recurrent:
+                if matched == full_boundary:
+                    state_by_key = dict(self._iter_all_recurrent_states())
+                    for key, snap in rec_snaps:
+                        st = state_by_key.get(key)
+                        if st is not None:
+                            st.restore_state(snap)
+                    self.recurrent_seq_len = matched
+                else:
+                    # matched == self._ckpt_len: rollback_to() restores the prompt-boundary
+                    # checkpoint and sets recurrent_seq_len itself.
+                    self.recurrent_seq_len = 0
+            self.cached_tokens = list(spilled_tokens[:matched])
+        self._drop_spill()
+        return matched

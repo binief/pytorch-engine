@@ -2224,6 +2224,14 @@ if __name__ == "__main__":
     test_begin_recurrent_verify_graph_cache_wiring()
     test_forward_verify_step_cpu_fallback_matches_eager()
     test_verify_triton_kernels_multirow()
+    from tests.test_kv_spill import (
+        test_kv_spill_hybrid_anchors_cpu,
+        test_kv_spill_partial_prefix_cpu,
+        test_kv_spill_roundtrip_nonhybrid_cpu,
+    )
+    test_kv_spill_roundtrip_nonhybrid_cpu()
+    test_kv_spill_partial_prefix_cpu()
+    test_kv_spill_hybrid_anchors_cpu()
     from tests.test_flash_attention import (
         test_attend_cpu_fallback_contract,
         test_flash_attn_toggle_cpu,

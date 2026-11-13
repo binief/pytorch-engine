@@ -270,6 +270,7 @@ class PyGGUFEngine:
         parallel_mode: Literal["auto", "tp", "pp"] = "auto",
         enable_cuda_graph: bool = True,
         flash_attn: bool = True,
+        kv_cpu_spill: bool = False,
         speculative_mtp: bool = True,
         mtp_draft_tokens: Optional[int] = None,
         mtp_adaptive: bool = True,
@@ -293,6 +294,7 @@ class PyGGUFEngine:
         self.default_enable_thinking = default_enable_thinking
         self.speculative_mtp = bool(speculative_mtp)
         self.flash_attn: bool = bool(flash_attn)
+        self.kv_cpu_spill: bool = bool(kv_cpu_spill)
         if mtp_draft_tokens is not None:
             # Explicit integer `mtp_draft_tokens` pins exact depth `k` unless overridden per request
             self.mtp_draft_tokens = max(1, min(8, int(mtp_draft_tokens)))
@@ -372,6 +374,7 @@ class PyGGUFEngine:
             recurrent_layers=self.model.recurrent_layer_flags,
             tp_devices=self.model.tp_devices if self.model.is_tensor_parallel else None,
             flash_attn=self.flash_attn,
+            kv_cpu_spill=self.kv_cpu_spill,
         )
         if self.model.mtp_head is not None:
             self.kv_manager.init_mtp_cache(
@@ -415,7 +418,7 @@ class PyGGUFEngine:
         if mtp_status:
             hybrid_parts.append(mtp_status)
         hybrid_note = f" | Hybrid=({', '.join(hybrid_parts)})" if hybrid_parts else ""
-        fa_note = "" if self.flash_attn else " | FlashAttn=off"
+        fa_note = ("" if self.flash_attn else " | FlashAttn=off") + (" | KVSpill=on" if self.kv_cpu_spill else "")
         print(f"[PyGGUF] Loaded '{self.model_id}' ({par_label}) across {dev_summary} in {load_s:.2f}s{hybrid_note}{fa_note}.")
 
         if any(d.type == "cuda" for d in active_devs):
@@ -423,6 +426,21 @@ class PyGGUFEngine:
             self._gpu_executor.submit(self._warmup_cuda_kernels).result()
 
     @torch.inference_mode()
+    def _maybe_spill_kv(self) -> None:
+        """Park trunk attention KV + recurrent states in CPU RAM between turns (opt-in `kv_cpu_spill`)."""
+        if not self.kv_cpu_spill:
+            return
+        try:
+            info = self.kv_manager.spill_kv_to_cpu()
+            if info is not None:
+                print(
+                    f"[PyGGUF] Spilled {info['bytes'] / 1e9:.2f} GB of KV/recurrent state to CPU RAM "
+                    f"({info['len']} tokens); will restore on the next prefix-cache hit."
+                )
+        except Exception as exc:
+            # Spill is purely an optimization for the next turn — never break serving on it.
+            print(f"[PyGGUF] KV spill to CPU failed ({exc}); the caches stay GPU-resident for now.")
+
     def _warmup_cuda_kernels(self) -> None:
         """Pre-compile Triton PTX kernels (including M=2 multi-row GEMV, MTP head, and M=1 CUDA Graphs)."""
         t_w = time.perf_counter()
@@ -543,7 +561,9 @@ class PyGGUFEngine:
             and (cfg.temperature <= 1.2)
         )
 
-        # 1. Prefix KV Cache Reuse
+        # 1. Prefix KV Cache Reuse (restore from CPU RAM first when spilling is enabled)
+        if self.kv_cpu_spill and cfg.cache_prompt:
+            self.kv_manager.restore_kv_prefix(prompt_ids)
         if cfg.cache_prompt:
             prefix_hit = self.kv_manager.match_prefix_length(prompt_ids)
             self.kv_manager.rollback_to(prefix_hit)
@@ -627,6 +647,7 @@ class PyGGUFEngine:
                 decode_time_s=time.perf_counter() - t_decode_start,
             )
             yield StreamChunk(delta_text="", token_id=first_tok, finish_reason=finish_reason, stats=res)
+            self._maybe_spill_kv()
             return
 
         all_tokens.append(first_tok)
@@ -656,6 +677,7 @@ class PyGGUFEngine:
                 decode_time_s=time.perf_counter() - t_decode_start,
             )
             yield StreamChunk(delta_text=decoded_so_far, token_id=first_tok, finish_reason=finish_reason, stats=res)
+            self._maybe_spill_kv()
             return
 
         yield StreamChunk(delta_text=delta, token_id=first_tok)
@@ -887,6 +909,7 @@ class PyGGUFEngine:
                         mtp_drafted=mtp_drafted,
                     )
                     yield StreamChunk(delta_text=piece, token_id=next_tok, finish_reason=finish_reason, stats=res)
+                    self._maybe_spill_kv()
                     return
 
                 yield StreamChunk(delta_text=piece, token_id=next_tok)
@@ -908,6 +931,7 @@ class PyGGUFEngine:
                     mtp_drafted=mtp_drafted,
                 )
                 yield StreamChunk(delta_text="", token_id=all_tokens[-1], finish_reason=finish_reason, stats=res)
+                self._maybe_spill_kv()
                 return
 
     def generate(

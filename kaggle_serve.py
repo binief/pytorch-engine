@@ -153,6 +153,7 @@ def launch_kaggle_server(
     cpu_threads: Optional[int] = None,
     enable_cuda_graph: bool = True,
     flash_attn: bool = True,
+    kv_cpu_spill: bool = False,
     speculative_mtp: bool = True,
     mtp_draft_tokens: Optional[int] = None,
     mtp_adaptive: bool = True,
@@ -202,6 +203,7 @@ def launch_kaggle_server(
         parallel_mode=parallel_mode,
         enable_cuda_graph=enable_cuda_graph,
         flash_attn=flash_attn,
+        kv_cpu_spill=kv_cpu_spill,
         speculative_mtp=speculative_mtp,
         mtp_draft_tokens=mtp_draft_tokens,
         mtp_adaptive=mtp_adaptive,
@@ -325,6 +327,7 @@ def main() -> None:
     parser.add_argument("--cpu-threads", type=int, default=None, help="PyTorch CPU intra-op threads (process-wide; default: unchanged)")
     parser.add_argument("--no-cuda-graph", action="store_true", help="Disable CUDAGraph capture for M=1 decode")
     parser.add_argument("--no-flash-attn", action="store_true", help="Disable the fused Triton GQA flash-attention (Path 3a); falls back to chunked online-softmax attention")
+    parser.add_argument("--kv-cpu-spill", action="store_true", help="Park trunk attention KV + recurrent state in CPU RAM between turns; restored automatically on prefix-cache hits (opt-in, saves VRAM for 256K sessions)")
     parser.add_argument("--rope-scaling-type", choices=["none", "linear", "ntk-aware", "yarn"], default=None,
                         help="Override RoPE scaling from GGUF metadata (extend context beyond trained length)")
     parser.add_argument("--rope-scaling-factor", type=float, default=None, help="RoPE scaling factor, e.g. 2.0/4.0/8.0 for YaRN")
@@ -357,6 +360,7 @@ def main() -> None:
         cpu_threads=args.cpu_threads,
         enable_cuda_graph=not args.no_cuda_graph,
         flash_attn=not args.no_flash_attn,
+        kv_cpu_spill=args.kv_cpu_spill,
         speculative_mtp=(not args.no_mtp) and (not args.no_speculative),
         mtp_draft_tokens=args.mtp_draft_tokens,
         mtp_adaptive=not args.no_adaptive_mtp,
