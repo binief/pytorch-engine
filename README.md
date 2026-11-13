@@ -54,6 +54,7 @@ Equivalent CLI flags on `kaggle_serve.py`: `--rope-scaling-type yarn --rope-scal
 - **GQA-folded chunked online-softmax** for big contexts/softcapping (see above).
 - **Zero-cost N-gram self-speculative decoding** + optional GGUF `draft-mtp` head with adaptive depth.
 - **Prefix KV cache reuse** across multi-turn requests and a GPU-resident top-k/top-p/min-p/repetition-penalty sampler (single sync per token).
+- **Optional CPU-RAM KV spill** (`kv_cpu_spill=True`, default off): at the end of each turn the trunk attention KV and (hybrid) recurrent states are cloned into pinned host RAM and the GPU buffers are freed; on the next request a prompt prefix matching the spill is restored in one host->device pass instead of being re-prefilled. Recurrent anchors are the full spill boundary or the mid-sequence prompt checkpoint (`_ckpt_len`); anything else falls back to full re-prefill. Ring (MTP) caches stay on GPU; MTP rebase is handled by the normal catch-up path. Disable at runtime with `kv_cpu_spill=False` / no CLI flag (`--kv-cpu-spill` to enable). Peak host RAM roughly doubles the in-flight KV footprint between turns — check `free -g` on Kaggle before enabling at 256K.
 
 On-GPU benchmark checklist for this addition (dual T4, Kaggle): prefill tok/s at 32K/64K context for the same prompt before/after (expect the win at long prefill, not at short-context decode, which uses Path 1); verify tok/s unchanged (Path 1 untouched); watch for softcap (Gemma) parity. No T4 speedup is claimed until measured.
 
