@@ -1,6 +1,6 @@
 # PyGGUF
 
-Python, PyTorch and Triton GGUF inference server. See `PyGGUF_GitHub_Kaggle.ipynb` to clone this repository and run it on a Kaggle GPU, or `PyGGUF_Kaggle_OpenAI_Server.ipynb` for the self-contained version.
+Python, PyTorch and Triton GGUF inference server. See `PyGGUF_GitHub_Kaggle.ipynb` to clone this repository and run it on a Kaggle GPU, or `PyGGUF_Kaggle_OpenAI_Server.ipynb` for the same server with identical benchmark/launch cells (both clone from GitHub).
 
 ## Kaggle
 
