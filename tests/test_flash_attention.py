@@ -19,7 +19,13 @@ import sys
 
 import torch
 
-from pygguf_engine.kv_cache import HAS_TRITON, LayerKVCache
+from pygguf_engine.kv_cache import (
+    HAS_TRITON,
+    LayerKVCache,
+    _FLASH_ATTN_SMEM_LIMIT,
+    _gqa_flash_attn_config,
+    _gqa_flash_attn_stage_bytes,
+)
 
 
 def test_gqa_flash_attn_interpreter_parity() -> None:
@@ -125,6 +131,27 @@ print("  [OK] TRITON_INTERPRET: GQA flash-attention matches the fp64 reference f
     print(proc.stdout)
 
 
+def test_gqa_flash_attn_config_fits_t4_smem() -> None:
+    # sm_75 (T4): every supported (kv_dtype, head_dim) must fit the 64 KiB per-block shared memory
+    for kv_dtype in ("fp16", "int8", "int4"):
+        for head_dim in (32, 64, 128, 256):
+            for q_len in (1, 16, 64, 512):
+                block_m, block_n, warps, stages = _gqa_flash_attn_config(q_len, head_dim, kv_dtype)
+                total = stages * _gqa_flash_attn_stage_bytes(block_n, head_dim, kv_dtype)
+                assert total <= _FLASH_ATTN_SMEM_LIMIT, (kv_dtype, head_dim, q_len, total)
+                assert block_m == (64 if q_len >= 64 else (32 if q_len >= 32 else 16))
+                assert warps == 4
+    # Regression: fp16 head_dim=256 must no longer request 131072 B (> 65536 B limit)
+    block_m, block_n, warps, stages = _gqa_flash_attn_config(512, 256, "fp16")
+    assert stages * _gqa_flash_attn_stage_bytes(block_n, 256, "fp16") <= _FLASH_ATTN_SMEM_LIMIT
+    assert (block_n, stages) == (32, 2)
+    # Pre-existing fast path is preserved for head_dim <= 128
+    for kv_dtype in ("fp16", "int8", "int4"):
+        assert _gqa_flash_attn_config(512, 128, kv_dtype)[1] == 64
+        assert _gqa_flash_attn_config(512, 128, kv_dtype)[3] == 2
+    print("  [OK] flash-attn launch config fits the T4 64 KiB shared-memory budget for all KV dtypes!")
+
+
 def test_attend_cpu_fallback_contract() -> None:
     # Torch fallback path: attend() must return correctly shaped/typed output on CPU regardless.
     dev = torch.device("cpu")
@@ -142,5 +169,6 @@ def test_attend_cpu_fallback_contract() -> None:
 
 if __name__ == "__main__":
     test_attend_cpu_fallback_contract()
+    test_gqa_flash_attn_config_fits_t4_smem()
     test_gqa_flash_attn_interpreter_parity()
     print("=== FLASH ATTENTION TESTS PASSED ===")
