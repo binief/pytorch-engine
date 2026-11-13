@@ -1598,6 +1598,7 @@ class LayerKVCache:
         kv_dtype: Literal["int4", "int8", "fp16"] = "int8",
         page_growth: int = 2048,
         sliding_window: Optional[int] = None,
+        flash_attn: bool = True,
     ) -> None:
         if kv_dtype == "int4" and (head_dim % 2 != 0):
             raise ValueError(f"kv_dtype='int4' requires even head_dim, got {head_dim}")
@@ -1606,6 +1607,9 @@ class LayerKVCache:
         self.max_seq_len = max_seq_len
         self.device = device
         self.kv_dtype: Literal["int4", "int8", "fp16"] = kv_dtype
+        # Fused Triton GQA flash attention (Path 3a) for long contexts / softcap. Set False to fall
+        # back to the chunked online-softmax path (useful for A/B runs or if the fused kernel misbehaves).
+        self.flash_attn: bool = bool(flash_attn)
         self.page_growth = page_growth
         self.sliding_window: Optional[int] = (
             int(sliding_window) if (sliding_window is not None and int(sliding_window) > 0) else None
@@ -2191,7 +2195,7 @@ class LayerKVCache:
         # Path 3a: Fused Triton GQA flash attention (single pass, tensor-core `tl.dot`, reads quantized
         # KV in-SRAM — no dequant materialization). Used for big contexts and softcap when possible.
         # Falls back to Path 3b if the launch exceeds shared memory (e.g. head_dim=256 fp16 on sm_75).
-        if HAS_TRITON and q.is_cuda and not is_ring and head_dim in (32, 64, 128, 256):
+        if self.flash_attn and HAS_TRITON and q.is_cuda and not is_ring and head_dim in (32, 64, 128, 256):
             global _flash_attn_smem_warned
             try:
                 dev = self.k_buf.device
@@ -2322,10 +2326,12 @@ class EngineKVCacheManager:
         kv_dtype: Literal["int4", "int8", "fp16"] = "int8",
         recurrent_layers: Optional[Sequence[bool]] = None,
         tp_devices: Optional[Sequence[torch.device]] = None,
+        flash_attn: bool = True,
     ) -> None:
         rec_flags = list(recurrent_layers) if recurrent_layers is not None else [False] * n_layers
         self.has_recurrent = any(rec_flags)
         self.tp_devices: List[torch.device] = list(tp_devices) if tp_devices and len(tp_devices) > 1 else []
+        self._flash_attn: bool = bool(flash_attn)
         tp_world = len(self.tp_devices)
 
         if tp_world > 1:
@@ -2341,6 +2347,7 @@ class EngineKVCacheManager:
                         max_seq_len=max_seq_len,
                         device=dev,
                         kv_dtype=kv_dtype,
+                        flash_attn=self._flash_attn,
                     )
                     for dev in self.tp_devices
                 ]
@@ -2366,6 +2373,7 @@ class EngineKVCacheManager:
                     max_seq_len=max_seq_len,
                     device=layer_devices[i],
                     kv_dtype=kv_dtype,
+                    flash_attn=self._flash_attn,
                 )
                 for i in range(n_layers)
             ]
@@ -2419,6 +2427,7 @@ class EngineKVCacheManager:
                     device=dev,
                     kv_dtype=self._kv_dtype,
                     sliding_window=win,
+                    flash_attn=self._flash_attn,
                 )
                 for dev in tp_list
             ]
@@ -2432,6 +2441,7 @@ class EngineKVCacheManager:
                 device=device,
                 kv_dtype=self._kv_dtype,
                 sliding_window=win,
+                flash_attn=self._flash_attn,
             )
         self.has_mtp = True
         self.mtp_cache_start = 0

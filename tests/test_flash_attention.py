@@ -152,6 +152,36 @@ def test_gqa_flash_attn_config_fits_t4_smem() -> None:
     print("  [OK] flash-attn launch config fits the T4 64 KiB shared-memory budget for all KV dtypes!")
 
 
+def test_flash_attn_toggle_cpu() -> None:
+    # `flash_attn=False` disables Path 3a (falling back to Path 2/3b); outputs must be identical on CPU
+    from pygguf_engine.kv_cache import EngineKVCacheManager
+
+    dev = torch.device("cpu")
+    base = dict(n_kv_heads=2, head_dim=32, max_seq_len=128, device=dev, kv_dtype="fp16", page_growth=8)
+    k = torch.randn(1, 2, 40, 32)
+    v = torch.randn(1, 2, 40, 32)
+    q = torch.randn(1, 4, 5, 32)
+    outs = []
+    for flag in (True, False):
+        cache = LayerKVCache(flash_attn=flag, **base)
+        assert cache.flash_attn is flag
+        cache.append(k, v, 0)
+        outs.append(cache.attend(q, start_pos=35, sm_scale=0.125, softcap=0.0))
+    assert torch.allclose(outs[0], outs[1])
+    # Manager plumbs the toggle down to every per-layer cache
+    mgr = EngineKVCacheManager(
+        n_layers=2, n_kv_heads=2, head_dim=32, max_seq_len=64,
+        layer_devices=[dev, dev], kv_dtype="fp16", flash_attn=False,
+    )
+    assert all(layer is None or layer.flash_attn is False for layer in mgr.layers)
+    mgr_on = EngineKVCacheManager(
+        n_layers=2, n_kv_heads=2, head_dim=32, max_seq_len=64,
+        layer_devices=[dev, dev], kv_dtype="fp16", flash_attn=True,
+    )
+    assert all(layer is None or layer.flash_attn is True for layer in mgr_on.layers)
+    print("  [OK] flash_attn toggle reaches LayerKVCache and EngineKVCacheManager!")
+
+
 def test_attend_cpu_fallback_contract() -> None:
     # Torch fallback path: attend() must return correctly shaped/typed output on CPU regardless.
     dev = torch.device("cpu")
@@ -169,6 +199,7 @@ def test_attend_cpu_fallback_contract() -> None:
 
 if __name__ == "__main__":
     test_attend_cpu_fallback_contract()
+    test_flash_attn_toggle_cpu()
     test_gqa_flash_attn_config_fits_t4_smem()
     test_gqa_flash_attn_interpreter_parity()
     print("=== FLASH ATTENTION TESTS PASSED ===")
