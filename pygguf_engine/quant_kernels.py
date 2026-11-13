@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
@@ -1035,6 +1036,64 @@ def repack_gguf_to_w8a16(
     )
 
 
+# ==============================================================================
+# 2b. Parallel row-split repack (GGML blocks never span rows, so any row split is exact)
+# ==============================================================================
+
+_ROW_SPLIT_MIN_BYTES = 64 * 1024 * 1024
+
+
+def _load_workers() -> int:
+    """Worker count for parallel weight repack/layer load. Override with `PYGGUF_LOAD_WORKERS` (1..16)."""
+    raw = os.environ.get("PYGGUF_LOAD_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, min(16, int(raw)))
+        except ValueError:
+            print(f"[PyGGUF] Ignoring invalid PYGGUF_LOAD_WORKERS={raw!r} (expected an integer 1..16)")
+    return max(1, min(4, (os.cpu_count() or 1)))
+
+
+def _repack_parallel(
+    raw_bytes: np.ndarray,
+    qtype: int,
+    rows: int,
+    cols: int,
+    device: torch.device,
+    workers: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Split a large quantized tensor into contiguous row chunks, repack each chunk on its own
+    thread, and concatenate. Bitwise-identical to the serial path (row-independent blocks)."""
+    block_elems, block_bytes = GGML_BLOCK_INFO[int(qtype)]
+    byte_per_row = (cols // block_elems) * block_bytes
+    chunk = (rows + workers - 1) // workers
+    bounds = [(r0, min(rows, r0 + chunk)) for r0 in range(0, rows, chunk)]
+    jobs = [(raw_bytes[r0 * byte_per_row : r1 * byte_per_row], r1 - r0) for r0, r1 in bounds]
+
+    def _job(pair: Tuple[np.ndarray, int]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        buf, nrows = pair
+        if qtype in SUB_5BIT_W4_QTYPES and cols % 32 == 0:
+            if qtype != GGMLQuantType.Q4_K or cols % 256 == 0:
+                return repack_gguf_to_w4a16(buf, qtype, nrows, cols, device)
+        return repack_gguf_to_w8a16(buf, qtype, nrows, cols, device)
+
+    if len(jobs) <= 1:
+        return _job(jobs[0])
+    with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="pygguf-repack") as pool:
+        parts = list(pool.map(_job, jobs))
+    with cuda_device_scope(device):
+        qw = torch.cat([p[0] for p in parts], dim=0)
+        sc = torch.cat([p[1] for p in parts], dim=0)
+        zr_parts = [p[2] for p in parts]
+        if all(z is not None for z in zr_parts):
+            zr: Optional[torch.Tensor] = torch.cat([z for z in zr_parts if z is not None], dim=0)
+        elif any(z is not None for z in zr_parts):
+            raise RuntimeError("row-split repack produced inconsistent zeros across chunks")
+        else:
+            zr = None
+    return qw, sc, zr
+
+
 def load_float_tensor(gguf_file: GGUFFile, name: str, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Load a 1D/2D unquantized (or small dequantized) tensor such as RMSNorm weights, biases, conv1d, or router gates."""
     info = gguf_file.tensors[name]
@@ -1735,6 +1794,7 @@ class GGUFQuantLinear(nn.Module):
         weight_name: str,
         bias_name: Optional[str] = None,
         device: torch.device = torch.device("cpu"),
+        workers: Optional[int] = None,
     ) -> "GGUFQuantLinear":
         info: GGUFTensorInfo = gguf_file.tensors[weight_name]
         out_features, in_features = int(info.shape[0]), int(info.shape[1])
@@ -1748,13 +1808,20 @@ class GGUFQuantLinear(nn.Module):
             w_fp16 = load_float_tensor(gguf_file, weight_name, device=device, dtype=torch.float16)
             return cls("fp16", in_features, out_features, w_fp16, bias=bias_t)
 
-        if info.qtype in SUB_5BIT_W4_QTYPES and in_features % 32 == 0:
-            if info.qtype != GGMLQuantType.Q4_K or in_features % 256 == 0:
-                qw, sc, zr = repack_gguf_to_w4a16(raw, info.qtype, out_features, in_features, device)
-                return cls("w4", in_features, out_features, qw, sc, zr, bias=bias_t)
-
-        qw, sc, zr = repack_gguf_to_w8a16(raw, info.qtype, out_features, in_features, device)
-        return cls("w8", in_features, out_features, qw, sc, zr, bias=bias_t)
+        n_workers = _load_workers() if workers is None else max(1, int(workers))
+        use_w4 = info.qtype in SUB_5BIT_W4_QTYPES and in_features % 32 == 0 and (
+            info.qtype != GGMLQuantType.Q4_K or in_features % 256 == 0
+        )
+        if n_workers > 1 and raw.nbytes >= _ROW_SPLIT_MIN_BYTES:
+            # Row-split the repack for vocab-sized weights (token_embd / untied output head);
+            # bitwise-identical to the serial path.
+            qw, sc, zr = _repack_parallel(raw, info.qtype, out_features, in_features, device, n_workers)
+        elif use_w4:
+            qw, sc, zr = repack_gguf_to_w4a16(raw, info.qtype, out_features, in_features, device)
+        else:
+            qw, sc, zr = repack_gguf_to_w8a16(raw, info.qtype, out_features, in_features, device)
+        mode = "w4" if use_w4 else "w8"
+        return cls(mode, in_features, out_features, qw, sc, zr, bias=bias_t)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape

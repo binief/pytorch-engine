@@ -33,6 +33,7 @@ from .quant_kernels import (
     FusedLinearPack,
     GGUFQuantLinear,
     GGUFQuantMoEExperts,
+    _load_workers,
     cuda_device_scope,
     exec_fused_act_mul_rowscale,
     exec_fused_add_rmsnorm,
@@ -40,6 +41,18 @@ from .quant_kernels import (
     exec_fused_rmsnorm_silu_gate,
     load_float_tensor,
 )
+
+from concurrent.futures import ThreadPoolExecutor
+
+
+def _build_layers_parallel(build: Any, n_layers: int) -> List[Any]:
+    """Construct layers in a thread pool (GGUF bytes are read-only shared mmap; repacks are
+    per-tensor pure). Order is preserved (`pool.map`)."""
+    workers = _load_workers()
+    if workers <= 1:
+        return [build(i) for i in range(n_layers)]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pygguf-load") as pool:
+        return list(pool.map(build, range(n_layers)))
 
 
 class GGUFRMSNorm(nn.Module):
@@ -1577,6 +1590,9 @@ class GGUFTransformerModel(nn.Module):
             max_context_len=config.max_context_len,
         )
 
+        load_workers = _load_workers()
+        if load_workers > 1:
+            print(f"[PyGGUF] Weight-load parallelism: {load_workers} workers (set PYGGUF_LOAD_WORKERS=1 to disable)", flush=True)
         load_start = time.monotonic()
         def report_load(message: str) -> None:
             print(f"[PyGGUF] Loading {message} ({time.monotonic() - load_start:.1f}s elapsed)", flush=True)
@@ -1597,7 +1613,7 @@ class GGUFTransformerModel(nn.Module):
                         rope=self.rope,
                         tp_devices=self.tp_devices,
                     )
-            self.layers = nn.ModuleList([load_tp_block(i) for i in range(config.n_layers)])
+            self.layers = nn.ModuleList(_build_layers_parallel(load_tp_block, config.n_layers))
             self.recurrent_layer_flags: List[bool] = [bool(blk.is_recurrent) for blk in self.layers]
             self.has_recurrent_layers: bool = any(self.recurrent_layer_flags)
 
@@ -1648,7 +1664,7 @@ class GGUFTransformerModel(nn.Module):
                         rope=self.rope,
                         device=self.layer_devices[i],
                     )
-            self.layers = nn.ModuleList([load_pp_block(i) for i in range(config.n_layers)])
+            self.layers = nn.ModuleList(_build_layers_parallel(load_pp_block, config.n_layers))
             self.recurrent_layer_flags = [bool(blk.is_recurrent) for blk in self.layers]
             self.has_recurrent_layers = any(self.recurrent_layer_flags)
 
