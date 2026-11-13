@@ -20,11 +20,48 @@ from .quant_kernels import cuda_device_scope
 try:
     import triton
     import triton.language as tl
+    try:
+        from triton.runtime.errors import OutOfResources
+    except Exception:  # pragma: no cover - older/newer Triton layouts
+        OutOfResources = Exception  # type: ignore[assignment,misc]
     HAS_TRITON = True
 except ImportError:
     triton = None  # type: ignore[assignment]
     tl = None  # type: ignore[assignment]
+    OutOfResources = Exception  # type: ignore[assignment,misc]
     HAS_TRITON = False
+
+
+# sm_75 (Tesla T4) hard-caps per-block shared memory at 64 KiB; Kaggle T4 x2 included.
+_FLASH_ATTN_SMEM_LIMIT = 65536
+_flash_attn_smem_warned = False
+
+
+def _gqa_flash_attn_stage_bytes(block_n: int, head_dim: int, kv_dtype: str) -> int:
+    """Shared-memory bytes of one pipelined loop stage (K + V tiles + per-key scales)."""
+    if kv_dtype == "int4":
+        kv_cols, kv_elt = head_dim // 2, 1
+        scale_bytes = 4 * block_n * 2  # lo/hi fp16 scale pairs for both K and V
+    elif kv_dtype == "int8":
+        kv_cols, kv_elt = head_dim, 1
+        scale_bytes = 2 * block_n * 2  # fp16 scale per key for both K and V
+    else:  # fp16
+        kv_cols, kv_elt = head_dim, 2
+        scale_bytes = 0
+    return 2 * block_n * kv_cols * kv_elt + scale_bytes
+
+
+def _gqa_flash_attn_config(q_len: int, head_dim: int, kv_dtype: str) -> Tuple[int, int, int, int]:
+    """
+    Pick (BLOCK_M, BLOCK_N, num_warps, num_stages) for `_gqa_flash_attn_kernel` such that the
+    pipelined K+V tiles fit `_FLASH_ATTN_SMEM_LIMIT` bytes of shared memory (T4/sm_75 = 64 KiB).
+    Prefers BLOCK_N=64/num_stages=2 (fastest) and steps down until the estimate fits.
+    """
+    block_m = 64 if q_len >= 64 else (32 if q_len >= 32 else 16)
+    for block_n, stages in ((64, 2), (32, 2), (64, 1), (32, 1), (16, 1)):
+        if stages * _gqa_flash_attn_stage_bytes(block_n, head_dim, kv_dtype) <= _FLASH_ATTN_SMEM_LIMIT:
+            return block_m, block_n, 4, stages
+    return block_m, 16, 4, 1  # pragma: no cover - cannot happen for supported head_dims
 
 
 if HAS_TRITON:
@@ -2153,47 +2190,59 @@ class LayerKVCache:
 
         # Path 3a: Fused Triton GQA flash attention (single pass, tensor-core `tl.dot`, reads quantized
         # KV in-SRAM — no dequant materialization). Used for big contexts and softcap when possible.
+        # Falls back to Path 3b if the launch exceeds shared memory (e.g. head_dim=256 fp16 on sm_75).
         if HAS_TRITON and q.is_cuda and not is_ring and head_dim in (32, 64, 128, 256):
-            dev = self.k_buf.device
-            with cuda_device_scope(dev):
-                assert self.k_buf is not None and self.v_buf is not None
-                kv_kind = {"fp16": 0, "int8": 1, "int4": 2}[self.kv_dtype]
-                q_c = q.to(device=dev)
-                if q_c.dtype != torch.float16:
-                    q_c = q_c.to(torch.float16)
-                q2 = q_c.squeeze(0).contiguous()  # [n_heads, q_len, head_dim]
-                out_c = torch.empty((n_heads, q_len, head_dim), device=dev, dtype=torch.float16)
-                if self.kv_dtype == "int4":
-                    k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_scale, self.v_scale
-                elif self.kv_dtype == "int8":
-                    k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_scale, self.v_scale
-                else:  # fp16: scales unused (dummy pointers, never loaded)
-                    k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_buf, self.v_buf
-                block_m = 64 if q_len >= 64 else (32 if q_len >= 32 else 16)
-                softcap_val = float(softcap)
-                grid = (triton.cdiv(q_len, block_m), n_heads)
-                _gqa_flash_attn_kernel[grid](
-                    q2,
-                    k_src,
-                    ks_src,
-                    v_src,
-                    vs_src,
-                    out_c,
-                    start_pos,
-                    total_len,
-                    self.capacity,
-                    sm_scale,
-                    q_len,
-                    KV_DTYPE=kv_kind,
-                    SOFTCAP=softcap_val,
-                    GQA_GROUP=gqa_group,
-                    BLOCK_M=block_m,
-                    BLOCK_N=64,
-                    HEAD_DIM=head_dim,
-                    num_warps=4,
-                    num_stages=2,
-                )
-                return out_c.to(q.dtype).view(1, n_heads, q_len, head_dim)
+            global _flash_attn_smem_warned
+            try:
+                dev = self.k_buf.device
+                with cuda_device_scope(dev):
+                    assert self.k_buf is not None and self.v_buf is not None
+                    kv_kind = {"fp16": 0, "int8": 1, "int4": 2}[self.kv_dtype]
+                    q_c = q.to(device=dev)
+                    if q_c.dtype != torch.float16:
+                        q_c = q_c.to(torch.float16)
+                    q2 = q_c.squeeze(0).contiguous()  # [n_heads, q_len, head_dim]
+                    out_c = torch.empty((n_heads, q_len, head_dim), device=dev, dtype=torch.float16)
+                    if self.kv_dtype == "int4":
+                        k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_scale, self.v_scale
+                    elif self.kv_dtype == "int8":
+                        k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_scale, self.v_scale
+                    else:  # fp16: scales unused (dummy pointers, never loaded)
+                        k_src, v_src, ks_src, vs_src = self.k_buf, self.v_buf, self.k_buf, self.v_buf
+                    block_m, block_n, num_warps, num_stages = _gqa_flash_attn_config(
+                        q_len, head_dim, self.kv_dtype
+                    )
+                    softcap_val = float(softcap)
+                    grid = (triton.cdiv(q_len, block_m), n_heads)
+                    _gqa_flash_attn_kernel[grid](
+                        q2,
+                        k_src,
+                        ks_src,
+                        v_src,
+                        vs_src,
+                        out_c,
+                        start_pos,
+                        total_len,
+                        self.capacity,
+                        sm_scale,
+                        q_len,
+                        KV_DTYPE=kv_kind,
+                        SOFTCAP=softcap_val,
+                        GQA_GROUP=gqa_group,
+                        BLOCK_M=block_m,
+                        BLOCK_N=block_n,
+                        HEAD_DIM=head_dim,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                    )
+                    return out_c.to(q.dtype).view(1, n_heads, q_len, head_dim)
+            except OutOfResources:
+                if not _flash_attn_smem_warned:
+                    _flash_attn_smem_warned = True
+                    print(
+                        "[PyGGUF] Fused Triton GQA flash-attention exceeded shared memory; "
+                        "falling back to chunked online-softmax attention for this session."
+                    )
 
         # Path 3b: Online-Softmax Chunked Attention fallback (CPU / non-pow2 head_dim / ring+softcap).
         # GQA group is folded into the query-row dimension (`2*qc` rows per kv-head) so K/V chunks are

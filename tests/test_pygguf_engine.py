@@ -2224,8 +2224,13 @@ if __name__ == "__main__":
     test_begin_recurrent_verify_graph_cache_wiring()
     test_forward_verify_step_cpu_fallback_matches_eager()
     test_verify_triton_kernels_multirow()
-    from tests.test_flash_attention import test_attend_cpu_fallback_contract, test_gqa_flash_attn_interpreter_parity
+    from tests.test_flash_attention import (
+        test_attend_cpu_fallback_contract,
+        test_gqa_flash_attn_config_fits_t4_smem,
+        test_gqa_flash_attn_interpreter_parity,
+    )
     test_attend_cpu_fallback_contract()
+    test_gqa_flash_attn_config_fits_t4_smem()
     test_gqa_flash_attn_interpreter_parity()
     test_int4_kv_ring_mtp_and_adaptive_depth()
     test_qwen35_hybrid_deltanet_and_ud_quants()
