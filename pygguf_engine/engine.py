@@ -269,6 +269,7 @@ class PyGGUFEngine:
         devices: Optional[Sequence[str]] = None,
         parallel_mode: Literal["auto", "tp", "pp"] = "auto",
         enable_cuda_graph: bool = True,
+        flash_attn: bool = True,
         speculative_mtp: bool = True,
         mtp_draft_tokens: Optional[int] = None,
         mtp_adaptive: bool = True,
@@ -291,6 +292,7 @@ class PyGGUFEngine:
         self.gguf_path = Path(gguf_path)
         self.default_enable_thinking = default_enable_thinking
         self.speculative_mtp = bool(speculative_mtp)
+        self.flash_attn: bool = bool(flash_attn)
         if mtp_draft_tokens is not None:
             # Explicit integer `mtp_draft_tokens` pins exact depth `k` unless overridden per request
             self.mtp_draft_tokens = max(1, min(8, int(mtp_draft_tokens)))
@@ -369,6 +371,7 @@ class PyGGUFEngine:
             kv_dtype=kv_dtype,
             recurrent_layers=self.model.recurrent_layer_flags,
             tp_devices=self.model.tp_devices if self.model.is_tensor_parallel else None,
+            flash_attn=self.flash_attn,
         )
         if self.model.mtp_head is not None:
             self.kv_manager.init_mtp_cache(
@@ -412,7 +415,8 @@ class PyGGUFEngine:
         if mtp_status:
             hybrid_parts.append(mtp_status)
         hybrid_note = f" | Hybrid=({', '.join(hybrid_parts)})" if hybrid_parts else ""
-        print(f"[PyGGUF] Loaded '{self.model_id}' ({par_label}) across {dev_summary} in {load_s:.2f}s{hybrid_note}.")
+        fa_note = "" if self.flash_attn else " | FlashAttn=off"
+        print(f"[PyGGUF] Loaded '{self.model_id}' ({par_label}) across {dev_summary} in {load_s:.2f}s{hybrid_note}{fa_note}.")
 
         if any(d.type == "cuda" for d in active_devs):
             # Run warmup directly on the persistent GPU worker thread so its CUDA driver contexts are primed!
